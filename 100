@@ -1,0 +1,31 @@
+import tkinter as tk
+
+def convert_decimal_to_hex():
+    decimal_value = entry.get()
+    try:
+        decimal_value = int(decimal_value)
+        hex_value = hex(decimal_value)[2:].upper()
+        result_label.config(text=hex_value)
+    except ValueError:
+        result_label.config(text="Invalid input")
+
+# Create GUI window
+window = tk.Tk()
+window.title("Decimal UCID to Hex Converter")
+
+# Create input label and entry
+label = tk.Label(window, text="Enter Decimal UCID:")
+label.pack()
+entry = tk.Entry(window)
+entry.pack()
+
+# Create button to trigger conversion
+convert_button = tk.Button(window, text="Convert", command=convert_decimal_to_hex)
+convert_button.pack()
+
+# Create label to display result
+result_label = tk.Label(window, text="")
+result_label.pack()
+
+# Start GUI event loop
+window.mainloop()
