@@ -1,33 +1,44 @@
-import tkinter as tk
+# Assuming you have a GUI framework in place, import necessary modules
+from tkinter import Tk, Label, Entry, Button
 
-def convert_decimal_to_hex():
+# Define a function to convert decimal UCID to hex
+def convert_ucid():
+    # Get the decimal UCID value from the user via GUI
     decimal_ucid = int(entry.get())
-    hex_ucid = hex(decimal_ucid)[2:]  # Convert decimal to hexadecimal and remove '0x' prefix
     
-    # Split the hexadecimal value into three parts: first 5, next 5, and the rest
-    first_five = hex_ucid[:5]
-    next_five = hex_ucid[5:10]
-    rest = hex_ucid[10:]
+    # Convert the first 5 integers to hex
+    first_five = hex(decimal_ucid)[:5]
     
-    result_label.config(text=f"First 5: {first_five}\nNext 5: {next_five}\nRest: {rest}")
+    # Convert the next 5 integers to hex
+    next_five = hex(decimal_ucid)[5:10]
+    
+    # Convert the rest to hex
+    rest = hex(decimal_ucid)[10:]
+    
+    # Concatenate the three parts into a single string
+    hex_ucid = first_five + next_five + rest
+    
+    # Display the result in the GUI
+    result_label.config(text=hex_ucid)
 
-# Create the GUI window
-window = tk.Tk()
-window.title("Decimal UCID to Hex Conversion")
+# Create a GUI window
+window = Tk()
 
-# Create label and entry for decimal input
-decimal_label = tk.Label(window, text="Enter Decimal UCID:")
-decimal_label.pack()
-entry = tk.Entry(window)
+# Create a label for the input
+label = Label(window, text="Enter Decimal UCID:")
+label.pack()
+
+# Create an entry field for the user input
+entry = Entry(window)
 entry.pack()
 
-# Create button to trigger the conversion
-convert_button = tk.Button(window, text="Convert", command=convert_decimal_to_hex)
-convert_button.pack()
+# Create a button to initiate the conversion
+button = Button(window, text="Convert", command=convert_ucid)
+button.pack()
 
-# Create label to display the result
-result_label = tk.Label(window)
+# Create a label to display the result
+result_label = Label(window, text="")
 result_label.pack()
 
-# Start the GUI event loop
+# Run the GUI event loop
 window.mainloop()
