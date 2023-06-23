@@ -1,31 +1,33 @@
 import tkinter as tk
 
 def convert_decimal_to_hex():
-    decimal_value = entry.get()
-    try:
-        decimal_value = int(decimal_value)
-        hex_value = hex(decimal_value)[2:].upper()
-        result_label.config(text=hex_value)
-    except ValueError:
-        result_label.config(text="Invalid input")
+    decimal_ucid = int(entry.get())
+    hex_ucid = hex(decimal_ucid)[2:]  # Convert decimal to hexadecimal and remove '0x' prefix
+    
+    # Split the hexadecimal value into three parts: first 5, next 5, and the rest
+    first_five = hex_ucid[:5]
+    next_five = hex_ucid[5:10]
+    rest = hex_ucid[10:]
+    
+    result_label.config(text=f"First 5: {first_five}\nNext 5: {next_five}\nRest: {rest}")
 
-# Create GUI window
+# Create the GUI window
 window = tk.Tk()
-window.title("Decimal UCID to Hex Converter")
+window.title("Decimal UCID to Hex Conversion")
 
-# Create input label and entry
-label = tk.Label(window, text="Enter Decimal UCID:")
-label.pack()
+# Create label and entry for decimal input
+decimal_label = tk.Label(window, text="Enter Decimal UCID:")
+decimal_label.pack()
 entry = tk.Entry(window)
 entry.pack()
 
-# Create button to trigger conversion
+# Create button to trigger the conversion
 convert_button = tk.Button(window, text="Convert", command=convert_decimal_to_hex)
 convert_button.pack()
 
-# Create label to display result
-result_label = tk.Label(window, text="")
+# Create label to display the result
+result_label = tk.Label(window)
 result_label.pack()
 
-# Start GUI event loop
+# Start the GUI event loop
 window.mainloop()
