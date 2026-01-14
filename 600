@@ -1,0 +1,171 @@
+
+2
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+
+TARGETS_FILE="${1:?missing targets_file}"
+OUT_DIR="${2:?missing output_log_dir}"
+
+PARALLEL="${PARALLEL:-5}"
+MAX_TIME="${MAX_TIME:-15}"
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-3}"
+INSECURE_TLS="${INSECURE_TLS:-0}"
+ENV_NAME="${ENV_NAME:-}"
+
+mkdir -p "$OUT_DIR"
+
+day="$(date +%F)"
+TODAYS_FILE="${OUT_DIR}/med_stats-${day}.jsonl"
+LATEST_LINK="${OUT_DIR}/med_stats.jsonl"
+ln -sfn "$(basename "$TODAYS_FILE")" "$LATEST_LINK"
+
+collect_one() {
+  local name="$1"
+  local url="$2"
+
+  local ts start_ns end_ns lat_ms
+  local resp http_code body
+  local probe_host curl_rc
+  local status="fail"
+  local error=""
+
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  start_ns="$(date +%s%N)"
+  probe_host="$(hostname)"
+
+  local tls_flags=()
+  if [[ "${INSECURE_TLS}" == "1" ]]; then
+    tls_flags+=("-k")
+  fi
+
+  curl_rc=0
+  set +e
+  resp="$(
+    curl -s "${tls_flags[@]}" \
+      --connect-timeout "$CONNECT_TIMEOUT" \
+      --max-time "$MAX_TIME" \
+      -w $'\n%{http_code}' \
+      "$url"
+  )"
+  curl_rc=$?
+  set -e
+
+  http_code="$(printf '%s' "$resp" | tail -n 1)"
+  body="$(printf '%s' "$resp" | sed '$d')"
+  [[ -n "$http_code" ]] || http_code="000"
+
+  end_ns="$(date +%s%N)"
+  lat_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+  if [[ "$curl_rc" -ne 0 ]]; then
+    error="curl_error"
+  elif [[ "$http_code" != "200" ]]; then
+    error="non-200"
+  else
+    if echo "$body" | jq -e . >/dev/null 2>&1; then
+      status="pass"
+    else
+      error="invalid_json"
+    fi
+  fi
+
+  if [[ "$status" == "pass" ]]; then
+    jq -cn \
+      --arg ts "$ts" \
+      --arg env "$ENV_NAME" \
+      --arg name "$name" \
+      --arg url "$url" \
+      --arg probe_host "$probe_host" \
+      --arg status "$status" \
+      --arg http_code "$http_code" \
+      --argjson curl_rc "$curl_rc" \
+      --argjson latency_ms "$lat_ms" \
+      --argjson payload "$(echo "$body" | jq -c .)" \
+      '{
+        ts:$ts,
+        env:$env,
+        source_type:"med_stats",
+        name:$name,
+        url:$url,
+        probe_host:$probe_host,
+        status:$status,
+        http_code:$http_code,
+        curl_rc:$curl_rc,
+        latency_ms:$latency_ms,
+        payload:$payload
+      }'
+  else
+    jq -cn \
+      --arg ts "$ts" \
+      --arg env "$ENV_NAME" \
+      --arg name "$name" \
+      --arg url "$url" \
+      --arg probe_host "$probe_host" \
+      --arg status "$status" \
+      --arg error "$error" \
+      --arg http_code "$http_code" \
+      --argjson curl_rc "$curl_rc" \
+      --argjson latency_ms "$lat_ms" \
+      '{
+        ts:$ts,
+        env:$env,
+        source_type:"med_stats",
+        name:$name,
+        url:$url,
+        probe_host:$probe_host,
+        status:$status,
+        http_code:$http_code,
+        curl_rc:$curl_rc,
+        latency_ms:$latency_ms,
+        error:$error
+      }'
+  fi
+}
+
+export -f collect_one
+export ENV_NAME MAX_TIME CONNECT_TIMEOUT INSECURE_TLS
+
+tmpfile="$(mktemp)"
+trap 'rm -f "$tmpfile"' EXIT
+
+awk '
+  /^[[:space:]]*($|#)/ { next }
+  NF>=2 { print $1, $2; next }
+' "$TARGETS_FILE" \
+| xargs -n 2 -P "$PARALLEL" bash -c 'collect_one "$1" "$2"' _ \
+> "$tmpfile"
+
+cat "$tmpfile" >> "$TODAYS_FILE"
+
+
+
+
+3. SERVICE
+[Unit]
+Description=MErrrrrrD server stats collection
+
+[Service]
+Type=oneshot
+Environment=ENV_NAME=prod
+Environment=PARALLEL=5
+Environment=MAX_TIME=15
+Environment=CONNECT_TIMEOUT=3
+Environment=INSECURE_TLS=0
+ExecStart=/apps/healthchecks/med_server_stat_collection/med_stats_runner.sh /apps/healthchecks/merrrrd_server_stat_collection/targets_med_stats.txt /logs/zzz/merrrd_stats
+
+TIMER:
+[Unit]
+Description=Run MErrrDrrrrr server stats collection every 5 minutes
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=5min
+RandomizedDelaySec=10s
+Unit=med-stats.service
+
+[Install]
+WantedBy=timers.target
+
+
+
