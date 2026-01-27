@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+
+CHECK_TYPE="${1:?missing check_type (node|lb)}"
+TARGETS_FILE="${2:?missing targets_file}"
+OUT_DIR="${3:?missing output_log_dir}"
+
+PARALLEL="${PARALLEL:-10}"
+MAX_TIME="${MAX_TIME:-2}"
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-1}"
+INSECURE_TLS="${INSECURE_TLS:-1}"
+ENV_NAME="${ENV_NAME:-}"
+
+mkdir -p "$OUT_DIR"
+
+day="$(date +%F)"
+TODAYS_FILE="${OUT_DIR}/${CHECK_TYPE}_health-${day}.jsonl"
+LATEST_LINK="${OUT_DIR}/${CHECK_TYPE}_health.jsonl"
+ln -sfn "$(basename "$TODAYS_FILE")" "$LATEST_LINK"
+
+check_one() {
+  local cluster="$1"
+  local service="$2"
+  local node="$3"
+  local url="$4"
+  local require_node_id="${5:-0}"
+
+  local ts start_ns end_ns lat_ms
+  local resp http_code body
+  local status="fail"
+  local error=""
+  local app_version="" app_node_name="" uptime="" server_date=""
+  local probe_host curl_rc
+
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  start_ns="$(date +%s%N)"
+  probe_host="$(hostname)"
+
+  local tls_flags=()
+  if [[ "${INSECURE_TLS}" == "1" ]]; then
+    tls_flags+=("-k")
+  fi
+
+  curl_rc=0
+  set +e
+  resp="$(
+    curl -s "${tls_flags[@]}" \
+      --connect-timeout "$CONNECT_TIMEOUT" \
+      --max-time "$MAX_TIME" \
+      -w $'\n%{http_code}' \
+      "$url"
+  )"
+  curl_rc=$?
+  set -e
+
+  http_code="$(printf '%s' "$resp" | tail -n 1)"
+  body="$(printf '%s' "$resp" | sed '$d')"
+
+  if [[ -z "${http_code}" ]]; then
+    http_code="000"
+  fi
+
+  end_ns="$(date +%s%N)"
+  lat_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+  if [[ "$curl_rc" -ne 0 ]]; then
+    error="curl_error"
+  elif [[ "$http_code" != "200" ]]; then
+    error="non-200"
+  else
+    if echo "$body" | jq -e . >/dev/null 2>&1; then
+      app_version="$(echo "$body" | jq -r '.AppVersion // .appVersion // ""')"
+      app_node_name="$(echo "$body" | jq -r '(
+        .AppNodeName
+        // .appNodeName
+        // .App
+        // .app
+        // .NodeName
+        // .nodeName
+        // .Node
+        // .node
+        // ""
+      )')"
+      uptime="$(echo "$body" | jq -r '.Uptime // .uptime // ""')"
+      server_date="$(echo "$body" | jq -r '.Date // .date // ""')"
+
+      if [[ "$CHECK_TYPE" == "node" && "$require_node_id" == "1" && -z "$app_node_name" ]]; then
+        error="missing_node_id"
+      else
+        status="pass"
+      fi
+    else
+      error="invalid_json"
+    fi
+  fi
+
+  jq -cn \
+    --arg ts "$ts" \
+    --arg env "$ENV_NAME" \
+    --arg cluster "$cluster" \
+    --arg check_type "$CHECK_TYPE" \
+    --arg service "$service" \
+    --arg node "$node" \
+    --arg url "$url" \
+    --arg probe_host "$probe_host" \
+    --arg status "$status" \
+    --arg error "$error" \
+    --arg http_code "$http_code" \
+    --argjson curl_rc "$curl_rc" \
+    --argjson latency_ms "$lat_ms" \
+    --arg app_version "$app_version" \
+    --arg app_node_name "$app_node_name" \
+    --arg uptime "$uptime" \
+    --arg server_date "$server_date" \
+    '{
+      ts:$ts,
+      env:$env,
+      cluster:$cluster,
+      check_type:$check_type,
+      service:$service,
+      node:$node,
+      url:$url,
+      probe_host:$probe_host,
+      status:$status,
+      http_code:$http_code,
+      latency_ms:$latency_ms
+    }
+    + (if $error != "" then {error:$error} else {} end)
+    + (if $curl_rc != 0 then {curl_rc:$curl_rc} else {} end)
+    + (if $app_version != "" then {app_version:$app_version} else {} end)
+    + (if $app_node_name != "" then {app_node_name:$app_node_name} else {} end)
+    + (if $uptime != "" then {uptime:$uptime} else {} end)
+    + (if $server_date != "" then {server_date:$server_date} else {} end)
+    '
+}
+
+export -f check_one
+export CHECK_TYPE INSECURE_TLS MAX_TIME CONNECT_TIMEOUT ENV_NAME
+
+tmpfile="$(mktemp)"
+trap 'rm -f "$tmpfile"' EXIT
+
+awk '
+  /^[[:space:]]*($|#)/ { next }
+
+  # LB format: cluster service url
+  NF==3 { print $1, $2, "vip", $3, 0; next }
+
+  # Node format: cluster service node url [require_node_id]
+  NF==4 { print $1, $2, $3, $4, 0; next }
+  NF>=5 { print $1, $2, $3, $4, $5; next }
+' "$TARGETS_FILE" \
+| xargs -n 5 -P "$PARALLEL" bash -c 'check_one "$1" "$2" "$3" "$4" "$5"' _ \
+> "$tmpfile"
+
+cat "$tmpfile" >> "$TODAYS_FILE"
