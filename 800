@@ -1,0 +1,141 @@
+Healthchecks & MED Stats Collection
+Systemd timers that poll internal APIs and write JSONL logs for Splunk
+
+Overview
+We run three lightweight services (each triggered by a systemd timer) to collect:
+	1. LB/VIP health (simple “service up/down” view for broader engineering teams)
+	2. Node-level health (more detailed checks for core engineers/devs)
+	3. MED server stats (large JSON stats payload captured every 5 minutes)
+All collectors write JSONL: one JSON object per line, which Splunk ingests cleanly.
+
+What’s deployed
+1) LB health checks
+Units: healthcheck-lb.service + healthcheck-lb.timer
+Audience: broader engineering teams
+Goal: reduce noise — if LB is healthy, service is considered healthy
+Interval: typically every 30 seconds (configurable)
+Targets file: /etc/healthchecks/targets_lb.txt
+Logs: /logs/<env>/health/lb_health-YYYY-MM-DD.jsonl
+Symlink: /logs/<env>/health/lb_health.jsonl → today’s file
+2) Node health checks
+Units: healthcheck-node.service + healthcheck-node.timer
+Audience: core engineers / developers
+Goal: deep visibility into node-by-node health and network issues
+Interval: typically every 60 seconds (configurable)
+Targets file: /etc/healthchecks/targets_node.txt
+Logs: /logs/<env>/health/node_health-YYYY-MM-DD.jsonl
+Symlink: /logs/<env>/health/node_health.jsonl → today’s file
+3) MED server stats collection
+Units: med-stats.service + med-stats.timer
+Audience: operations + engineers for trending/troubleshooting
+Goal: capture full JSON stats payload from the MED endpoint periodically
+Interval: every 5 minutes
+Install path: /apps/healthchecks/med_server_stat_collection/
+	• script: med_stats_runner.sh
+	• targets: targets_med_stats.txt
+Logs: /logs/zzz/med_stats/med_stats-YYYY-MM-DD.jsonl
+Symlink: /logs/zzz/med_stats/med_stats.jsonl → today’s file
+
+Targets file formats
+LB targets
+Path: /etc/healthchecks/targets_lb.txt
+Format (2 columns):
+	• service url
+Example:
+
+# service  url
+sss  https://sss-vip.ggc.local/sss/api/v1/health
+abc  https://abc-vip.ggc.local/abc/api/v1/health
+Notes:
+	• Blank lines and # comments are ignored
+	• The log will record node as "vip" automatically
+
+Node targets
+Path: /etc/healthchecks/targets_node.txt
+Format (3 or 4 columns):
+	• service node url [require_node_id]
+Example:
+
+# service node  url                                                require_node_id
+sss      rww01 https://server1.ggc.local:8810/sss/api/v1/health     1
+sss      rww02 https://server2.ggc.local:8810/sss/api/v1/health     1
+xyz      rww01 https://server1.ggc.local:9999/xyz/api/v1/health     0
+What require_node_id means:
+	• 1 = response must include some node/app identity field
+(supports AppNodeName, appNodeName, app, node, etc.)
+	• 0 or omitted = don’t require identity (still validates HTTP + JSON)
+
+MED stats targets
+Path: /apps/healthchecks/med_server_stat_collection/targets_med_stats.txt
+Format (2 columns):
+	• name url
+Example:
+
+# name  url
+med01 http://server1:8888/srsrec/v1/health
+# med02 http://server2:8888/srsrec/v1/health
+
+What gets logged (high level)
+Each poll produces an event with common fields like:
+	• ts (UTC ISO timestamp)
+	• env
+	• service / name
+	• node (for node checks; LB uses "vip")
+	• url
+	• probe_host (host running the checks)
+	• status (pass or fail)
+	• http_code (string: "200", "404", "000", etc.)
+	• curl_rc (curl exit code if curl fails)
+	• latency_ms
+	• error (only on failures)
+For MED stats, successful events also include:
+	• payload = the full JSON response (compact)
+
+Common failure modes
+	• curl_error + curl_rc
+		○ 7 = connect failed (port unreachable / refused / routing / firewall)
+		○ 28 = timeout
+		○ 60 = TLS/cert validation issue (if TLS verification is enabled)
+	• non-200 (HTTP not 200)
+	• invalid_json (response isn’t valid JSON)
+	• missing_node_id (only when require_node_id=1)
+
+systemd commands
+Status
+
+systemctl status healthcheck-lb.timer healthcheck-node.timer med-stats.timer
+Force a run now
+
+systemctl start healthcheck-lb.service
+systemctl start healthcheck-node.service
+systemctl start med-stats.service
+Logs
+
+journalctl -u healthcheck-lb.service -n 50 --no-pager
+journalctl -u healthcheck-node.service -n 50 --no-pager
+journalctl -u med-stats.service -n 50 --no-pager
+
+Splunk ingestion guidance (UF)
+Recommended monitor paths
+Monitor daily files, not symlinks:
+	• Health:
+		○ /logs/<env>/health/node_health-*.jsonl
+		○ /logs/<env>/health/lb_health-*.jsonl
+	• MED stats:
+		○ /logs/zzz/med_stats/med_stats-*.jsonl
+Sourcetype settings (Splunk Cloud GUI)
+	• Event breaks: newline, no line merge
+	• Timestamp: extracted from ts
+		○ Prefix: "ts":"
+		○ Format: %Y-%m-%dT%H:%M:%SZ
+	• Indexed extractions: JSON (optional but convenient)
+
+Dashboard intent
+For broader engineering teams
+Use LB-only panels (VIP availability). As long as LB is healthy, they don’t need to worry about node blips.
+For core engineers / developers
+Include node-level panels:
+	• node failures by service/node
+	• curl exit code breakdown (curl_rc)
+	• node latency percentiles
+	• “LB OK but nodes failing” mismatch view
