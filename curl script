@@ -1,0 +1,30 @@
+#!/bin/bash
+
+URL="http://your-healthcheck-api/health"
+LOG_FILE="./healthcheck_log.csv"
+INTERVAL=5
+
+touch "$LOG_FILE"
+[ -s "$LOG_FILE" ] || echo 'timestamp,curl_exit_code,http_code,time_total,remote_ip,error,body' >> "$LOG_FILE"
+
+while true; do
+  TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+  TMP_BODY=$(mktemp)
+  TMP_ERR=$(mktemp)
+
+  METRICS=$(curl -sS \
+    --connect-timeout 5 \
+    --max-time 10 \
+    -o "$TMP_BODY" \
+    -w "%{http_code},%{time_total},%{remote_ip}" \
+    "$URL" 2>"$TMP_ERR")
+  CURL_EXIT_CODE=$?
+
+  BODY=$(tr '\n' ' ' < "$TMP_BODY" | sed 's/"/""/g')
+  ERR=$(tr '\n' ' ' < "$TMP_ERR" | sed 's/"/""/g')
+
+  echo "\"$TIMESTAMP\",\"$CURL_EXIT_CODE\",$METRICS,\"$ERR\",\"$BODY\"" >> "$LOG_FILE"
+
+  rm -f "$TMP_BODY" "$TMP_ERR"
+  sleep "$INTERVAL"
+done
