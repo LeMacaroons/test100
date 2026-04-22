@@ -152,3 +152,92 @@ sudo chmod 0755 /apps/healthchecks/text_healthchecks/text_health_runner.sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now text-health.timer
 sudo systemctl start text-health.service
+
+
+
+
+
+
+
+
+---
+- name: Deploy portal health check service
+  hosts: utility_servers
+  become: true
+
+  vars:
+    cfg_dir: /apps/healthchecks/text_healthchecks
+    systemd_dir: /etc/systemd/system
+
+  tasks:
+    - name: Create config directory
+      ansible.builtin.file:
+        path: "{{ cfg_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create portal health log directory
+      ansible.builtin.file:
+        path: "/logs/{{ log_dir }}/portal_health"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy portal health runner
+      ansible.builtin.template:
+        src: templates/portal_health_runner.sh.j2
+        dest: "{{ cfg_dir }}/portal_health_runner.sh"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy portal health target file
+      ansible.builtin.template:
+        src: templates/target_portal_health.txt.j2
+        dest: "{{ cfg_dir }}/target_portal_health.txt"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Deploy portal health service unit
+      ansible.builtin.template:
+        src: templates/portal_health_service.j2
+        dest: "{{ systemd_dir }}/portal_health.service"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Deploy portal health timer unit
+      ansible.builtin.template:
+        src: templates/portal_health_timer.j2
+        dest: "{{ systemd_dir }}/portal_health.timer"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Normalize line endings for portal health files
+      ansible.builtin.shell: |
+        sed -i 's/\r$//' "{{ cfg_dir }}/portal_health_runner.sh"
+        sed -i 's/\r$//' "{{ cfg_dir }}/target_portal_health.txt"
+        sed -i 's/\r$//' "{{ systemd_dir }}/portal_health.service"
+        sed -i 's/\r$//' "{{ systemd_dir }}/portal_health.timer"
+      args:
+        executable: /bin/bash
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start portal health timer
+      ansible.builtin.systemd:
+        name: portal_health.timer
+        enabled: true
+        state: started
+
+    - name: Start portal health service once
+      ansible.builtin.systemd:
+        name: portal_health.service
+        state: started
