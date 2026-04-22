@@ -1,0 +1,154 @@
+runner
+
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+
+TARGETS_FILE="${1:?missing targets_file}"
+OUT_DIR="${2:?missing output_log_dir}"
+
+PARALLEL="${PARALLEL:-5}"
+MAX_TIME="${MAX_TIME:-5}"
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-2}"
+INSECURE_TLS="${INSECURE_TLS:-1}"
+ENV_NAME="${ENV_NAME:-}"
+
+mkdir -p "$OUT_DIR"
+
+day="$(date +%F)"
+TODAYS_FILE="${OUT_DIR}/text_health-${day}.jsonl"
+LATEST_LINK="${OUT_DIR}/text_health.jsonl"
+ln -sfn "$(basename "$TODAYS_FILE")" "$LATEST_LINK"
+
+check_one() {
+  local service="$1"
+  local url="$2"
+
+  local ts start_ns end_ns lat_ms
+  local resp http_code body
+  local status="fail"
+  local error=""
+  local probe_host curl_rc
+
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  start_ns="$(date +%s%N)"
+  probe_host="$(hostname)"
+
+  local tls_flags=()
+  if [[ "${INSECURE_TLS}" == "1" ]]; then
+    tls_flags+=("-k")
+  fi
+
+  curl_rc=0
+  set +e
+  resp="$(
+    curl -s "${tls_flags[@]}" \
+      --connect-timeout "$CONNECT_TIMEOUT" \
+      --max-time "$MAX_TIME" \
+      -w $'\n%{http_code}' \
+      "$url"
+  )"
+  curl_rc=$?
+  set -e
+
+  http_code="$(printf '%s' "$resp" | tail -n 1)"
+  body="$(printf '%s' "$resp" | sed '$d')"
+
+  if [[ -z "$http_code" ]]; then
+    http_code="000"
+  fi
+
+  end_ns="$(date +%s%N)"
+  lat_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+  if [[ "$curl_rc" -ne 0 ]]; then
+    error="curl_error"
+  elif [[ "$http_code" != "200" ]]; then
+    error="non-200"
+  elif [[ "$body" != *Healthy* ]]; then
+    error="unexpected_body"
+  else
+    status="pass"
+  fi
+
+  jq -cn \
+    --arg ts "$ts" \
+    --arg env "$ENV_NAME" \
+    --arg check_type "text_health" \
+    --arg service "$service" \
+    --arg url "$url" \
+    --arg probe_host "$probe_host" \
+    --arg status "$status" \
+    --arg error "$error" \
+    --arg http_code "$http_code" \
+    --arg body "$body" \
+    --argjson curl_rc "$curl_rc" \
+    --argjson latency_ms "$lat_ms" \
+    '{
+      ts:$ts,
+      env:$env,
+      check_type:$check_type,
+      service:$service,
+      url:$url,
+      probe_host:$probe_host,
+      status:$status,
+      http_code:$http_code,
+      latency_ms:$latency_ms
+    }
+    + (if $error != "" then {error:$error} else {} end)
+    + (if $curl_rc != 0 then {curl_rc:$curl_rc} else {} end)
+    + (if $body != "" then {body:$body} else {} end)
+    '
+}
+
+export -f check_one
+export INSECURE_TLS MAX_TIME CONNECT_TIMEOUT ENV_NAME
+
+tmpfile="$(mktemp)"
+trap 'rm -f "$tmpfile"' EXIT
+
+awk '
+  /^[[:space:]]*($|#)/ { next }
+  NF>=2 { print $1, $2; next }
+' "$TARGETS_FILE" \
+| xargs -n 2 -P "$PARALLEL" bash -c 'check_one "$1" "$2"' _ \
+> "$tmpfile"
+
+cat "$tmpfile" >> "$TODAYS_FILE"
+
+
+
+
+2. SERVICE 
+/etc/systemd/system/text-health.service
+
+[Unit]
+Description=Plain text health checks
+
+[Service]
+Type=oneshot
+Environment=ENV_NAME=prod
+Environment=PARALLEL=5
+Environment=MAX_TIME=5
+Environment=CONNECT_TIMEOUT=2
+Environment=INSECURE_TLS=1
+ExecStart=/apps/healthchecks/text_healthchecks/text_health_runner.sh /apps/healthchecks/text_healthchecks/targets_text_health.txt /logs/zzz/text_health
+
+Timer
+/etc/systemd/system/text-health.timer
+[Unit]
+Description=Run plain text health checks every 1 minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+RandomizedDelaySec=5s
+Unit=text-health.service
+
+[Install]
+WantedBy=timers.target
+Enable it
+sudo chmod 0755 /apps/healthchecks/text_healthchecks/text_health_runner.sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now text-health.timer
+sudo systemctl start text-health.service
