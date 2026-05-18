@@ -1,0 +1,78 @@
+# 1 Control 1 — Recording Completeness: Automatic Call Recording Enforcement
+### Description:
+CIR is designed so that recording is triggered automatically at the application layer and is not dependent on end-user action within the application. Once a user is enabled for recording in Genesys Config Server, they are configured for 100% voice and screen recording by default. Unless an explicit policy has been defined in the recording configuration to limit the capture rate. There is no partial coverage by accident; any deviation from 100% is an intentional, configured decision.
+
+As for user override capability, there is none. The recording playback and management portal has no functionality that allows any user, regardless of role, to modify or suppress a recording configuration. The only way to change whether a user is subject to recording is a direct change to that user's profile in Genesys Config Server, which is a privileged action managed exclusively by the Connect Operations team. I believe i did demonstrarte this live during our walkthrough. If you need additional evidence, please let me know what specially is needed. 
+
+
+# 2 
+An automated daily reconciliation report is in place and published in Power BI. The report compares total calls handled from the switch against total recordings captured, surfacing any delta between the two on a day-by-day basis. Formal ownership of the review process for this report has not yet been officially assigned.
+
+
+Link to report - 
+Screenshots- 
+
+# Control 3 — Recording Completeness: Real-Time Recording Failure Alert
+Recording failure alerting operates at two levels. Infrastructure monitoring covering memory, disk, CPU and related thresholds is handled by the server team who manage and respond to those alerts as part of their standard operations. 
+
+At the application level, Splunk Cloud is configured with alert rules that fire when specific conditions indicate a problem.
+
+One example of an active alert is a rule that detects when no successful recordings have been received for a given client within the last 60 minutes. When that condition is met, Splunk automatically sends an email notification to the operations team identifying which client or clients are affected, giving them the opportunity to investigate and intervene before a more significant gap develops.
+
+Sample alert- 
+Condition- <screenshot>
+Alert email - <screenshot>
+
+# Control 4 — Data Integrity: Tamper-Proof Storage (WORM/Read-Only)
+Recordings are initially written to GCP Filestore as transitional storage during the active recording session. Once the recording is finalized it is moved to Google Cloud Storage buckets for long term archival where it resides for the duration of the retention period.
+
+The GCP buckets are configured as dual-region, meaning data is automatically replicated across two geographic regions providing both redundancy and resilience against localized infrastructure events. Soft delete protection is enabled on the buckets which means that even if a delete operation were attempted the object is retained for a defined recovery window rather than being permanently removed immediately. 
+
+Files are encrypted and cannot be modified in place. Once written as GCP Cloud Storage does not allow overwriting an existing object without an explicit versioned write, preserving the integrity of the original recording file.
+Access to the buckets is governed entirely through GCP IAM policies. Only cloud administrators hold the permissions necessary to interact with the buckets at an administrative level and that access is logged through GCP Cloud Audit Logs providing a full trail of who accessed or acted on the storage environment and when.
+
+Screenshot of the storage <bucket>
+
+# 6 Control 6 — Deletion Management: Restricted Deletion Rights
+### Will probably need to clarify on Monday if the platform admin role has the abolity to delete objects from the recording buckets 
+
+The recording portal does not expose any selective deletion capability regardless of user role. There is no option within the application for any user, including administrators, to manually delete individual recording files. Deletion in the context of this environment is handled exclusively through retention policies that are configured at the client level, meaning recordings are only removed when they reach the end of their defined retention period as a scheduled, policy-driven process rather than a manual action.
+
+Outside of the application layer, cloud administrators do have the technical ability to delete encrypted media files directly from the GCP buckets. This access is tightly governed through GCP IAM policies and is limited to a small number of individuals within the cloud infrastructure team along with a handful of other authorized personnel. Access to the buckets is reviewed periodically as part of the organization's broader compliance obligations to ensure that only the appropriate individuals retain that level of access.
+
+As evidence for this control we can provide the GCP IAM policy configuration showing which accounts hold bucket-level access, along with documentation of the client-level retention policy configuration demonstrating that deletion is policy-driven rather than manually initiated.
+###  Screenshots of the IAM policies
+
+
+# Control 8 — Retention Management: Retention Policy Enforcement
+The retention feature is currently in its final testing phase and will be implemented in the near term. In preparation for this, we have already worked with the legal team to gather the required retention periods for each client. Once the feature is enabled, retention policies will be applied on a per client basis in line with those documented legal requirements, ensuring each client's recordings are retained for the appropriate duration.
+
+
+-- Doiuble check these 
+# Control 9 — Audit Logging: User Activity Logging
+All user actions within the recording portal are logged and forwarded to Splunk Cloud where they are available for review and analysis. This covers the full spectrum of user activity including login, playback, download and configuration changes, with each event capturing the relevant identifying information such as user ID, timestamp and the action performed.
+In addition to the existing Splunk logging pipeline, there is an ongoing effort to integrate audit event logs with the SecOps team, which will further strengthen visibility and ensure that user activity within the recording environment is factored into the organization's broader security monitoring posture. This integration is currently in progress and we will provide an update on timeline as it becomes available.
+As evidence for this control we can provide a sample extract from Splunk showing user activity log events across the different action types along with the field structure confirming user ID and timestamp are consistently captured.
+
+# Control 10 — Audit Logging: Immutable Log Protection
+Audit logs in this environment are protected at two levels. Infrastructure logs generated within GCP are routed to log sinks where they are retained and access to those sinks is governed through GCP IAM policies, ensuring that deletion or modification is restricted to only those with the appropriate permissions.
+At the application level, logs flowing into Splunk Cloud are inherently protected from modification. As demonstrated during the walkthrough with the audit team, there is no mechanism within Splunk Cloud that allows any user to edit or alter an indexed log event once it has been written. This is a platform level constraint rather than a configuration choice. Furthermore, deletion of any object or index within Splunk Cloud is not something that can be performed unilaterally by internal Splunk administrators. Any such action requires a formal support ticket to be raised with Splunk directly, introducing an external checkpoint that adds an additional layer of protection against unauthorized or accidental log deletion.
+As evidence for this control we can provide the GCP log sink configuration along with IAM policy documentation showing access restrictions, and Splunk Cloud configuration details confirming the platform level immutability of indexed events.
+
+# Control 11 — Monitoring: Periodic Log Review
+Monitoring and periodic log review for the recording environment falls within the remit of the SecOps team. As audit event logs are being integrated with SecOps as part of the ongoing effort referenced in Control 9, the SecOps team is best positioned to speak to how monitoring is handled, what tooling and processes are in place for anomaly detection, and how suspicious activity is escalated and resolved. We would recommend the audit team engage SecOps directly for evidence and walkthrough of this control.
+
+# Control #12 - Configuration Management
+All changes are tracked in Jira Connect Platform Change Management (CPCM) project, including the reason for change, implementation details, testing/validation steps, approvals, and deployment notes. 
+
+Significant or higher-risk changes, such as arch design changes that could impact severy impact production are reviewed through the regular CAB/change management process before implementation.
+
+After deployment, the team validates the change using application checks, Splunk Clud logs, and sample call/recording verification to confirm recording behavior remains operating as expected.
+
+# Control #13 - 
+End user access to the call recording application is managed through the Connect Portal. 
+The recording application relies on the roles and entitlements passed from the Connect Portal to determine what functions a user can perform, such as search, playback or download where applicable. 
+
+Access is intended to follow least-privilege principles based on the user’s approved role.
+Documentation and evidence for the access control workflow, role definitions, approval process, and user-role mapping should be provided by the Connect Portal Team or the Oprtations team who manages the Connect Portal Access. 
+
