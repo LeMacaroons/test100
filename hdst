@@ -1,0 +1,42 @@
+I wanted to run a small headset certification effort by you before I go any further with it.
+
+One of the side projects I’ve been supporting for Bill over the years is testing and standardizing end-user telephony equipment, primarily headsets now that hard phones are largely out of the picture. We have several newer headset models and a couple of new vendors that need to be tested and approved for broader global use.
+
+When we started formalizing headset certification years ago, I had built a small Raspberry Pi-based test jig out of pocket. That setup gave us a more consistent way to compare headset behavior across models, clients, firmware versions, and use cases. Unfortunately, the jig was lost during the COVID office moves, and with the amount of CIR work over the last couple of years, I have not had the same ability to thoroughly test some of the newer models.
+
+I think rebuilding the jig is becoming more important now because the headset landscape has changed. The older headsets with analog microphones generally produced very good and predictable results. Most manufacturers have since moved away from analog microphones and are now using digital MEMS microphones. Those work well, but in my experience they are a lot more sensitive to firmware, gain handling, softphone behavior, WebRTC processing, and vendor-specific configuration. Without proper testing and configuration, results can be inconsistent.
+
+Without a repeatable test jig, the alternative is mostly manual and ad hoc testing: individual call samples, subjective listening tests, limited user feedback, and one-off comparisons. That can still provide useful signal, but it is harder to reproduce, harder to compare across models, and harder to defend when deciding what should be approved, conditionally approved, or rejected globally.
+
+The rebuilt jig would use a Raspberry Pi with an audio HAT as the controller and I/O interface, an adjustable mini amplifier for gain and level control, a reference speaker/mic path, and a foam head fixture. The goal is to keep headset placement, mic distance, and speaker alignment consistent across tests so that we can compare devices under repeatable conditions.
+
+WER/transcription accuracy would be one measurable output, but the larger goal is to determine which devices are actually reliable for production use across our different telephony environments.
+
+This should also help us answer whether $200+ headsets are truly necessary for certain use cases, or whether lower-cost models can meet the same practical requirements in some environments with small configuration changes.
+
+I’m also including a rough diagram so you can see what I’m thinking.
+
+<architecture diagram here>
+
+The main parts for this setup would be:
+
+* Raspberry Pi
+* HiFi DAC HAT module
+* Mini amplifier
+* Reference speaker/mic components
+* Audio cables/adapters
+* Wiring/connectors
+* Mounting hardware
+* Miscellaneous small components
+
+The total cost should be approximately $600–$700.
+
+Once we have a collection of repeatable data, I think it may also be worth publishing the results internally through a small static site, possibly something like headsets.connect.com, similar to LandingPages. That would likely be cleaner than maintaining headset data across Smartsheet, Confluence, and Excel workbooks.
+
+The site could become the source of truth for approved models, conditionally approved models, rejected models, test notes, headset-specific audio samples, transcription WER, known issues, FAQs, recommended softphone/WebRTC settings, and support guidance.
+
+As a possible phase2, once we have enough test data and a narrowed-down device list, I’d also like to look at on-prem centralized headset firmware management. Almost all big name brands like Jabra, Epos, Poly/HP etc have solutions that can report firmware versions and push updates remotely and silently. It would be useful operationally because many headset-related issues come down to firmware mismatches between the headset, dongle, and softphone/WebRTC stack.
+
+I would treat that as a separate follow-up effort since it would need POCs, planning, and InfoSec review and probably some endpoint/client management discussion. I just think it is worth mentioning now because the certification work and firmware lifecycle management are closely related.
+
+If you’re okay with the approach, I can send over the parts list/BOM for review and we can decide the best path for purchasing or reimbursement.
