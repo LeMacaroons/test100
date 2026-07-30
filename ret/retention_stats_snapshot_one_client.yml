@@ -1,0 +1,59 @@
+---
+# ============================================================================
+# Pull a full statistics snapshot for ONE client - current overall state,
+# NOT limited to any particular retention cutoff (timeTo = now, not a
+# client's target cutoff date). This is a separate call from the cutoff
+# check used elsewhere; the two answer different questions.
+#
+# Reusable from both playbooks. Caller must set, before including:
+#   stats_snapshot_client_name    - which client to query
+#   stats_snapshot_triggered_by   - 'nightly-scheduled' or 'manual'
+#
+# Appends one event to retention_stats_log_lines (written to disk by the
+# calling playbook, in the /stats subfolder).
+# ============================================================================
+
+- name: "{{ stats_snapshot_client_name }} - get full statistics snapshot (current overall state)"
+  ansible.builtin.uri:
+    url: "{{ retention_api_base }}/statistics"
+    method: POST
+    user: "{{ retention_api_user }}"
+    password: "{{ retention_api_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      client_name: "{{ stats_snapshot_client_name }}"
+      timeFrom: "2000-01-01T00:00:00Z"
+      timeTo: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+    status_code: 200
+    return_content: true
+  register: stats_snapshot_result
+
+- name: "{{ stats_snapshot_client_name }} - append full statistics snapshot event"
+  ansible.builtin.set_fact:
+    retention_stats_log_lines: >-
+      {{ (retention_stats_log_lines | default([])) + [ {
+        'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'event_type': 'client_statistics_snapshot',
+        'run_id': run_id,
+        'triggered_by': stats_snapshot_triggered_by,
+        'client_name': stats_snapshot_client_name,
+        'voice_records_total': (stats_snapshot_result.json.results.voiceRecordsCount.total | int),
+        'voice_records_none_delete': (stats_snapshot_result.json.results.voiceRecordsCount.noneDelete | int),
+        'oldest_call_id': ((stats_snapshot_result.json.results.oldestCallId | default({}, true)).callId | default('none', true)),
+        'oldest_call_stop_time': ((stats_snapshot_result.json.results.oldestCallId | default({}, true)).stopTime | default('none', true)),
+        'audio_files_cloud': (stats_snapshot_result.json.results.audioFiles.numberFilesInCloud | int),
+        'audio_size_cloud_bytes': (stats_snapshot_result.json.results.audioFiles.totalFilesSizeInCloud | default(0, true) | int),
+        'audio_files_nfs': (stats_snapshot_result.json.results.audioFiles.numberFilesInNfs | int),
+        'audio_size_nfs_bytes': (stats_snapshot_result.json.results.audioFiles.totalFilesSizeInNfs | default(0, true) | int),
+        'audio_files_total': (stats_snapshot_result.json.results.audioFiles.totalNumberFiles | int),
+        'audio_size_total_bytes': (stats_snapshot_result.json.results.audioFiles.totalFilesSize | default(0, true) | int),
+        'video_files_cloud': (stats_snapshot_result.json.results.videoFiles.numberFilesInCloud | int),
+        'video_size_cloud_bytes': (stats_snapshot_result.json.results.videoFiles.totalFilesSizeInCloud | default(0, true) | int),
+        'video_files_nfs': (stats_snapshot_result.json.results.videoFiles.numberFilesInNfs | int),
+        'video_size_nfs_bytes': (stats_snapshot_result.json.results.videoFiles.totalFilesSizeInNfs | default(0, true) | int),
+        'video_files_total': (stats_snapshot_result.json.results.videoFiles.totalNumberFiles | int),
+        'video_size_total_bytes': (stats_snapshot_result.json.results.videoFiles.totalFilesSize | default(0, true) | int),
+        'total_transcriptions_done': (stats_snapshot_result.json.results.totalDoneTranscriptions | int),
+        'errors': stats_snapshot_result.json.results.errors
+      } ] }}
