@@ -1,0 +1,108 @@
+---
+# ============================================================================
+# Hourly Statistics Snapshot - All Clients
+# ============================================================================
+#
+# Purpose: runs on its own independent hourly Azure DevOps schedule
+# (separate release from the nightly job-submission one). Loops through
+# every client in clients.yml and pulls one full, current-state statistics
+# snapshot for each, logging to /apps/retention_log/stats/.
+#
+# Deliberately does NOT try to compute before/after or deltas itself - it
+# just logs regular, evenly-spaced readings. Splunk (timechart/delta) is
+# what figures out rate of change, backlog draining speed, growth/shrink
+# trends, etc. from the resulting time series. This also means visibility
+# isn't tied to when a retention job happens to run - you get the shape of
+# progress throughout the whole night, not just one net number the next
+# morning.
+#
+# --------------------------------------------------------------------------
+# Wiring into Azure DevOps Classic Release, scheduled hourly:
+# --------------------------------------------------------------------------
+# This should be its OWN Release pipeline/definition, separate from the
+# nightly job-submission one, with its own Scheduled release trigger set to
+# run every hour (Edit -> Triggers -> Scheduled release trigger -> hourly).
+#
+#   ansible-playbook hourly_stats_snapshot.yml \
+#     --extra-vars "retention_api_user=$(retention_api_user)"
+#
+# Map your SECRET password variable to an environment variable named
+# RETENTION_API_PASSWORD on the task - do not pass it via --extra-vars.
+#
+# --------------------------------------------------------------------------
+# Scaling consideration:
+# --------------------------------------------------------------------------
+# This calls the statistics API once per client, every hour, for every
+# client in clients.yml (whether or not they currently have a job running).
+# Fine for a handful of clients; if the client list grows large, consider
+# either a coarser interval (every 2-4 hours) or restricting this to only
+# clients not yet fully caught up.
+# ============================================================================
+
+- name: Hourly Statistics Snapshot - All Clients
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - clients.yml
+
+  vars:
+    retention_api_base: "https://rwsgreen3.ggg.com/sir/api/v1/ctrl"
+    retention_api_user: "{{ retention_api_user }}"
+    retention_api_password: "{{ lookup('ansible.builtin.env', 'RETENTION_API_PASSWORD') }}"
+
+    retention_log_dir: "/apps/retention_log"
+    retention_log_dir_stats: "{{ retention_log_dir }}/stats"
+    run_timestamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+    run_id: "hourly-{{ run_timestamp }}"
+
+  tasks:
+
+    - name: Validate credentials are present
+      ansible.builtin.assert:
+        that:
+          - retention_api_user is defined and retention_api_user | length > 0
+          - retention_api_password | length > 0
+        fail_msg: >
+          Missing retention_api_user (--extra-vars) or RETENTION_API_PASSWORD
+          (environment variable on the task).
+
+    - name: Validate a client list was loaded
+      ansible.builtin.assert:
+        that:
+          - clients is defined
+          - clients | length > 0
+        fail_msg: "clients.yml did not load, or the clients list is empty."
+
+    - name: Ensure stats log directory exists
+      ansible.builtin.file:
+        path: "{{ retention_log_dir_stats }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize the stats log-line accumulator for this run
+      ansible.builtin.set_fact:
+        retention_stats_log_lines: []
+
+    - name: Pull statistics snapshot for every client
+      ansible.builtin.include_tasks: retention_stats_snapshot_one_client.yml
+      loop: "{{ clients }}"
+      loop_control:
+        loop_var: client_item
+        label: "{{ client_item.name }}"
+      vars:
+        stats_snapshot_client_name: "{{ client_item.name }}"
+        stats_snapshot_triggered_by: "hourly-scheduled"
+
+    - name: Write statistics snapshots to disk for Universal Forwarder pickup
+      ansible.builtin.copy:
+        dest: "{{ retention_log_dir_stats }}/{{ run_id }}.log"
+        content: "{{ retention_stats_log_lines | map('to_json') | join('\n') }}\n"
+        mode: "0644"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >
+          Hourly statistics snapshot complete for {{ clients | length }} client(s).
+          Log: {{ retention_log_dir_stats }}/{{ run_id }}.log
