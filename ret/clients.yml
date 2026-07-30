@@ -1,0 +1,42 @@
+---
+# ============================================================================
+# Per-Client Retention Backfill Targets
+# ============================================================================
+#
+# One entry per client currently in the manual backfill process. Each client's
+# retention_cutoff_date is set manually (based on their retention agreement,
+# onboarding date, and how much backlog they have) - NOT computed as a rolling
+# "N days before today" window, since that varies per client.
+#
+# *** ORDER MATTERS ***
+# This list is now also the processing QUEUE order. The nightly playbook
+# (nightly_retention_submit.yml) processes ONE client at a time: it checks
+# every client top to bottom, finds the FIRST one not yet caught up to their
+# cutoff, and submits a job for only that one. Everyone listed after that
+# client waits untouched until the ones ahead of them are fully caught up.
+# Reorder this list to change who gets priority.
+#
+# Maintenance: once a client is fully caught up (confirmed via the Splunk
+# dashboard), you can either leave them here (the playbook will just keep
+# skipping them harmlessly every night as it moves down the queue) or remove
+# their entry once the automatic pipeline has confirmed ownership going
+# forward.
+#
+# To onboard a new client into the backfill process, add a new entry below
+# with their name and target cutoff date, in whatever position reflects
+# their priority relative to the others.
+# ============================================================================
+
+clients:
+  - name: CLIENT9
+    retention_cutoff_date: "2025-10-01"
+
+  - name: CLIENT12
+    retention_cutoff_date: "2024-06-15"
+
+  - name: CLIENT33
+    retention_cutoff_date: "2023-01-01"
+
+  # Add additional clients here, one block each, in priority order:
+  # - name: CLIENTXX
+  #   retention_cutoff_date: "YYYY-MM-DD"
