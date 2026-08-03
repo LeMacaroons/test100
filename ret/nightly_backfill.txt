@@ -19,27 +19,23 @@
 # directly) with a command line similar to:
 #
 #   ansible-playbook client_retention_backfill.yml \
-#     --extra-vars "client_name=$(client_name) retention_date=$(retention_date) retention_api_user=$(retention_api_user) retention_api_base=$(retention_api_base) env_code=$(env_code) limit=$(limit) stop_in_seconds=$(stop_in_seconds) simulation_mode=$(simulation_mode)"
+#     --extra-vars "client_name=$(client_name) retention_date=$(retention_date) retention_api_user=$(retention_api_user) retention_api_base=$(retention_api_base) env_code=$(env_code) limit=$(limit) stop_in_seconds=$(stop_in_seconds) simulation_mode=$(simulation_mode) projectid=$(projectid) cir_api_secret=$(cir_api_secret) json_file=$(json_file)"
 #
-# Where all of the above (except RETENTION_API_PASSWORD) are Release
-# pipeline variables (set "client_name" and "retention_date" to "Settable
-# at release time" so an engineer keys them in when starting a release).
+# Where all of the above are Release pipeline variables (set "client_name"
+# and "retention_date" to "Settable at release time" so an engineer keys
+# them in when starting a release).
 #
-# IMPORTANT - do NOT pass the password through --extra-vars (Ansible can echo
-# extra-vars in verbose/debug output). Instead, mark your password Release
-# variable as a SECRET, and map it to an environment variable on the task
-# named RETENTION_API_PASSWORD (in the task's "Environment Variables" /
-# "Additional environment variables" section). This playbook reads it from
-# that environment variable directly - see retention_api_password below.
+# The retention API password is fetched from Google Secret Manager at
+# runtime (see below) - nothing password-related needs to be set as a
+# task-level environment variable or Release secret variable here.
 #
 # --------------------------------------------------------------------------
-# Required inputs (pass via --extra-vars unless noted) - NO DEFAULTS, all
+# Required inputs (pass via --extra-vars) - NO DEFAULTS, all
 # must be explicitly supplied every run:
 # --------------------------------------------------------------------------
 #   client_name             - e.g. "CLIENT9"
 #   retention_date           - cutoff date, format YYYY-MM-DD
 #   retention_api_user       - basic auth username
-#   RETENTION_API_PASSWORD   - env var, basic auth password (NOT an extra-var)
 #   retention_api_base       - retention API base URL
 #   env_code                 - environment/cluster code, used to build the log path
 #                              (e.g. "blue", "orange", "gcp_cluster1a")
@@ -48,6 +44,18 @@
 #   simulation_mode           - true/false - dry run vs real delete. Missing
 #                              this now fails the play loudly rather than
 #                              silently defaulting to a dry run.
+#   projectid                - GCP project ID for Secret Manager
+#   cir_api_secret            - name of the secret holding the retention API password
+#   json_file                 - credential file identifier (filename minus .json)
+#                              under /shared/config/admin/, used to auth to GCP
+#
+# The password fetch itself:
+#   1. gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json
+#   2. gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}
+# Both tasks use `no_log: true` so the credential file handling and the
+# secret VALUE itself never appear in Ansible's console/verbose output. Do
+# not remove no_log from either task, and do not add a debug task that
+# prints retention_api_password.
 #
 # NOTE: none of these are redeclared as self-assignments in the vars: block
 # below (e.g. NOT `limit: "{{ limit }}"`) - Ansible cannot safely do
@@ -72,10 +80,6 @@
 
     retention_cutoff_date: "{{ retention_date }}T00:00:00Z"
     completion_buffer_seconds: 60
-
-    # Pulled from an environment variable, never from --extra-vars, so it
-    # never appears in Ansible's verbose/debug command-line echo.
-    retention_api_password: "{{ lookup('ansible.builtin.env', 'RETENTION_API_PASSWORD') }}"
 
     # Splunk log output - derived from env_code, which must come in via
     # --extra-vars (validated below). See nightly_retention_submit.yml for
@@ -106,18 +110,47 @@
           - client_name is defined and client_name | length > 0
           - retention_date is defined and retention_date | length > 0
           - retention_api_user is defined and retention_api_user | length > 0
-          - retention_api_password | length > 0
           - retention_api_base is defined and retention_api_base | length > 0
           - env_code is defined and env_code | length > 0
           - limit is defined and limit | string | length > 0
           - stop_in_seconds is defined and stop_in_seconds | string | length > 0
           - simulation_mode is defined and simulation_mode | string | length > 0
+          - projectid is defined and projectid | length > 0
+          - cir_api_secret is defined and cir_api_secret | length > 0
+          - json_file is defined and json_file | length > 0
         fail_msg: >
           Missing one or more required inputs: client_name, retention_date,
           retention_api_user, retention_api_base, env_code, limit,
-          stop_in_seconds, simulation_mode (all via --extra-vars), or
-          RETENTION_API_PASSWORD (environment variable on the task). None of
-          these have defaults - all must be explicitly supplied.
+          stop_in_seconds, simulation_mode, projectid, cir_api_secret, or
+          json_file (all via --extra-vars). None of these have defaults -
+          all must be explicitly supplied.
+
+    # ------------------------------------------------------------------
+    # Authenticate to Google Cloud, then fetch the retention API password
+    # from Secret Manager. no_log is mandatory on both tasks below - do
+    # not remove it, and do not add a debug task that prints the result.
+    # ------------------------------------------------------------------
+    - name: auth gcloud
+      ansible.builtin.shell: "gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json --force --quiet"
+      changed_when: false
+      no_log: true
+
+    - name: get password
+      ansible.builtin.shell: "gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}"
+      register: cir_api_secret_value
+      changed_when: false
+      no_log: true
+
+    - name: Set retention_api_password from the retrieved secret
+      ansible.builtin.set_fact:
+        retention_api_password: "{{ cir_api_secret_value.stdout }}"
+      no_log: true
+
+    - name: Validate the password was actually retrieved
+      ansible.builtin.assert:
+        that:
+          - retention_api_password | length > 0
+        fail_msg: "Retrieved an empty password from Google Secret Manager - check cir_api_secret and projectid."
 
     - name: Log run parameters (kept here since this may be the only durable
         record of run mode if Splunk access isn't handy at the time)
