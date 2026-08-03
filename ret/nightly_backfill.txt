@@ -1,0 +1,328 @@
+---
+# ============================================================================
+# Client Data Retention - Manual Backfill Playbook
+# ============================================================================
+#
+# Purpose: one-off, manually-triggered retention run for a single client, used
+# to catch a client up to a cutover date before the automatic retention
+# pipeline (processRetentionScanTimerDb) takes over for that client going
+# forward. This is NOT the automatic pipeline - it is the bounded, operator-
+# initiated backfill described in the retention procedure doc.
+#
+# Flow: statistics (before) -> start retention job -> wait -> statistics
+# (after) -> compare and report.
+#
+# --------------------------------------------------------------------------
+# Wiring this into an Azure DevOps Classic Release:
+# --------------------------------------------------------------------------
+# Add an "Ansible" task (or a Bash/Command line task running `ansible-playbook`
+# directly) with a command line similar to:
+#
+#   ansible-playbook client_retention_backfill.yml \
+#     --extra-vars "client_name=$(client_name) retention_date=$(retention_date) retention_api_user=$(retention_api_user) retention_api_base=$(retention_api_base) env_code=$(env_code) limit=$(limit) stop_in_seconds=$(stop_in_seconds) simulation_mode=$(simulation_mode)"
+#
+# Where all of the above (except RETENTION_API_PASSWORD) are Release
+# pipeline variables (set "client_name" and "retention_date" to "Settable
+# at release time" so an engineer keys them in when starting a release).
+#
+# IMPORTANT - do NOT pass the password through --extra-vars (Ansible can echo
+# extra-vars in verbose/debug output). Instead, mark your password Release
+# variable as a SECRET, and map it to an environment variable on the task
+# named RETENTION_API_PASSWORD (in the task's "Environment Variables" /
+# "Additional environment variables" section). This playbook reads it from
+# that environment variable directly - see retention_api_password below.
+#
+# --------------------------------------------------------------------------
+# Required inputs (pass via --extra-vars unless noted) - NO DEFAULTS, all
+# must be explicitly supplied every run:
+# --------------------------------------------------------------------------
+#   client_name             - e.g. "CLIENT9"
+#   retention_date           - cutoff date, format YYYY-MM-DD
+#   retention_api_user       - basic auth username
+#   RETENTION_API_PASSWORD   - env var, basic auth password (NOT an extra-var)
+#   retention_api_base       - retention API base URL
+#   env_code                 - environment/cluster code, used to build the log path
+#                              (e.g. "blue", "orange", "gcp_cluster1a")
+#   limit                    - records per scan (e.g. 500)
+#   stop_in_seconds           - how long the retention job may run, in seconds
+#   simulation_mode           - true/false - dry run vs real delete. Missing
+#                              this now fails the play loudly rather than
+#                              silently defaulting to a dry run.
+#
+# NOTE: none of these are redeclared as self-assignments in the vars: block
+# below (e.g. NOT `limit: "{{ limit }}"`) - Ansible cannot safely do
+# `foo: "{{ foo }}"` (with or without a default filter) when foo isn't
+# already supplied externally; that causes a recursive-template error, and
+# would even break the validation task's own "is defined" check. Extra-vars
+# are already directly usable without redeclaring them - only genuinely
+# derived values (like retention_log_dir, built from env_code) belong here.
+#
+# ============================================================================
+
+- name: Client Data Retention - Manual Backfill
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Statistics "timeFrom" - a fixed far-past date so the statistics call
+    # covers "everything up to the cutoff". Adjust if the dev team wants this
+    # parameterized instead of fixed.
+    stats_time_from: "2000-01-01T00:00:00Z"
+
+    retention_cutoff_date: "{{ retention_date }}T00:00:00Z"
+    completion_buffer_seconds: 60
+
+    # Pulled from an environment variable, never from --extra-vars, so it
+    # never appears in Ansible's verbose/debug command-line echo.
+    retention_api_password: "{{ lookup('ansible.builtin.env', 'RETENTION_API_PASSWORD') }}"
+
+    # Splunk log output - derived from env_code, which must come in via
+    # --extra-vars (validated below). See nightly_retention_submit.yml for
+    # the matching design notes. Same directory structure, same JSON-lines
+    # format, so manual and nightly-scheduled runs show up together in one
+    # Splunk view. General backlog/storage trending comes from the separate
+    # hourly_stats_snapshot.yml playbook, not from this file.
+    retention_log_dir: "/logs/{{ env_code }}/retention_log"
+    retention_log_dir_jobs: "{{ retention_log_dir }}/jobs"
+    run_timestamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+    run_id: "manual-{{ client_name }}-{{ run_timestamp }}"
+
+    # Verify these environment variable names against your actual ADO task
+    # environment - falls back to 'unknown' rather than failing if wrong.
+    ado_release_id: "{{ lookup('ansible.builtin.env', 'RELEASE_RELEASEID') | default('unknown', true) }}"
+    ado_requested_for: "{{ lookup('ansible.builtin.env', 'RELEASE_DEPLOYMENT_REQUESTEDFOR') | default('unknown', true) }}"
+
+  tasks:
+
+    # ------------------------------------------------------------------
+    # Guard rails - fail fast and loudly rather than silently doing the
+    # wrong thing with a missing or blank parameter. No defaults anywhere -
+    # everything below must be explicitly supplied.
+    # ------------------------------------------------------------------
+    - name: Validate required inputs are present
+      ansible.builtin.assert:
+        that:
+          - client_name is defined and client_name | length > 0
+          - retention_date is defined and retention_date | length > 0
+          - retention_api_user is defined and retention_api_user | length > 0
+          - retention_api_password | length > 0
+          - retention_api_base is defined and retention_api_base | length > 0
+          - env_code is defined and env_code | length > 0
+          - limit is defined and limit | string | length > 0
+          - stop_in_seconds is defined and stop_in_seconds | string | length > 0
+          - simulation_mode is defined and simulation_mode | string | length > 0
+        fail_msg: >
+          Missing one or more required inputs: client_name, retention_date,
+          retention_api_user, retention_api_base, env_code, limit,
+          stop_in_seconds, simulation_mode (all via --extra-vars), or
+          RETENTION_API_PASSWORD (environment variable on the task). None of
+          these have defaults - all must be explicitly supplied.
+
+    - name: Log run parameters (kept here since this may be the only durable
+        record of run mode if Splunk access isn't handy at the time)
+      ansible.builtin.debug:
+        msg: >
+          Starting retention backfill - client={{ client_name }},
+          cutoff={{ retention_cutoff_date }}, simulation_mode={{ simulation_mode }},
+          stop_in_seconds={{ stop_in_seconds }}
+
+    - name: Ensure retention log directory exists
+      ansible.builtin.file:
+        path: "{{ retention_log_dir_jobs }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize the log-line accumulator for this run
+      ansible.builtin.set_fact:
+        retention_log_lines: []
+
+    # ------------------------------------------------------------------
+    # BEFORE snapshot
+    # ------------------------------------------------------------------
+    - name: Get BEFORE statistics
+      ansible.builtin.uri:
+        url: "{{ retention_api_base }}/statistics"
+        method: POST
+        user: "{{ retention_api_user }}"
+        password: "{{ retention_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          client_name: "{{ client_name }}"
+          timeFrom: "{{ stats_time_from }}"
+          timeTo: "{{ retention_cutoff_date }}"
+        status_code: 200
+        return_content: true
+      register: stats_before
+      no_log: false  # body/response contain no secrets; keep visible for troubleshooting
+
+    - name: Show BEFORE totals
+      ansible.builtin.debug:
+        msg: >
+          BEFORE - total voice records: {{ stats_before.json.results.voiceRecordsCount.total }},
+          oldest call stopTime: {{ (stats_before.json.results.oldestCallId | default({}, true)).stopTime | default('none - already clear', true) }}
+
+    # ------------------------------------------------------------------
+    # Start the retention job
+    # ------------------------------------------------------------------
+    - name: Start retention job
+      ansible.builtin.uri:
+        url: "{{ retention_api_base }}/retention"
+        method: POST
+        user: "{{ retention_api_user }}"
+        password: "{{ retention_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          client_name: "{{ client_name }}"
+          "#simulation": "{{ simulation_mode | bool }}"
+          limit: "{{ limit | int }}"
+          retentionTimeOlderThan: "{{ retention_cutoff_date }}"
+          stopInSeconds: "{{ stop_in_seconds | int }}"
+          numberOfScans: 0
+          responseByJobId: true
+        status_code: 200
+        return_content: true
+      register: retention_start
+
+    - name: Show job id and Splunk search string
+      ansible.builtin.debug:
+        msg: >
+          Job started: {{ retention_start.json.jobId }}.
+          Splunk search for later reference (if/when you have Splunk access):
+          {{ retention_start.json.searchSplunk }}
+
+    - name: Append job-submission event for Splunk log file
+      ansible.builtin.set_fact:
+        retention_log_lines: >-
+          {{ retention_log_lines + [ {
+            'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'event_type': 'retention_job_submitted',
+            'run_id': run_id,
+            'triggered_by': 'manual',
+            'env_code': env_code,
+            'ado_requested_for': ado_requested_for,
+            'client_name': client_name,
+            'job_id': retention_start.json.jobId,
+            'retention_time_older_than': retention_cutoff_date,
+            'limit': (limit | int),
+            'stop_in_seconds': (stop_in_seconds | int),
+            'number_of_scans': 0,
+            'simulation_mode': (simulation_mode | bool),
+            'retention_api_base': retention_api_base,
+            'ado_release_id': ado_release_id,
+            'search_splunk': retention_start.json.searchSplunk,
+            'status_code': retention_start.json.statusCode
+          } ] }}
+
+    # ------------------------------------------------------------------
+    # Wait for the job's time budget to elapse.
+    # NOTE: there is currently no way to poll true job status (no Splunk API
+    # access, no confirmed status endpoint) - this is a fixed wait, not a
+    # confirmation the job is actually finished. Revisit if a status/poll
+    # mechanism becomes available.
+    # ------------------------------------------------------------------
+    - name: Wait for job time budget to elapse
+      ansible.builtin.pause:
+        seconds: "{{ (stop_in_seconds | int) + completion_buffer_seconds }}"
+
+    # ------------------------------------------------------------------
+    # AFTER snapshot
+    # ------------------------------------------------------------------
+    - name: Get AFTER statistics
+      ansible.builtin.uri:
+        url: "{{ retention_api_base }}/statistics"
+        method: POST
+        user: "{{ retention_api_user }}"
+        password: "{{ retention_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          client_name: "{{ client_name }}"
+          timeFrom: "{{ stats_time_from }}"
+          timeTo: "{{ retention_cutoff_date }}"
+        status_code: 200
+        return_content: true
+      register: stats_after
+
+    - name: Compute before/after summary facts
+      ansible.builtin.set_fact:
+        records_before: "{{ stats_before.json.results.voiceRecordsCount.total | int }}"
+        records_after: "{{ stats_after.json.results.voiceRecordsCount.total | int }}"
+        oldest_before: "{{ (stats_before.json.results.oldestCallId | default({}, true)).stopTime | default('none', true) }}"
+        oldest_after: "{{ (stats_after.json.results.oldestCallId | default({}, true)).stopTime | default('none', true) }}"
+
+    - name: Final run summary
+      ansible.builtin.debug:
+        msg:
+          - "Client: {{ client_name }}"
+          - "Cutoff requested: {{ retention_cutoff_date }}"
+          - "Simulation mode: {{ simulation_mode }}"
+          - "Job ID: {{ retention_start.json.jobId }}"
+          - "Voice records BEFORE: {{ records_before }}"
+          - "Voice records AFTER:  {{ records_after }}"
+          - "Records deleted (before - after): {{ (records_before | int) - (records_after | int) }}"
+          - "Oldest remaining call BEFORE: {{ oldest_before }}"
+          - "Oldest remaining call AFTER:  {{ oldest_after }}"
+          - "Errors reported by statistics API (after): {{ stats_after.json.results.errors }}"
+
+    # ------------------------------------------------------------------
+    # Did we actually catch this client up to the requested cutoff?
+    # If oldestCallId is null after the run, there's nothing older than the
+    # cutoff left at all - full success. If it's still present and its
+    # stopTime is older than the cutoff, the job ran out of time budget
+    # before finishing this client's backlog.
+    # ------------------------------------------------------------------
+    - name: Determine if the requested cutoff has been fully reached (date-only string comparison)
+      ansible.builtin.set_fact:
+        cutoff_reached: >-
+          {{ (
+            (oldest_after == 'none')
+            or (oldest_after[:10] >= retention_date)
+          ) | bool }}
+
+    - name: WARNING - cutoff not fully reached, client may need a re-run
+      ansible.builtin.debug:
+        msg: >
+          WARNING: oldest remaining call ({{ oldest_after }}) is still older than
+          the requested cutoff ({{ retention_cutoff_date }}). The job most likely
+          ran out of its stopInSeconds time budget before finishing this
+          client's full backlog - consider re-running for the same client/date.
+      when: not cutoff_reached
+
+    - name: Confirm full success if nothing older than cutoff remains
+      ansible.builtin.debug:
+        msg: "SUCCESS: no records older than the cutoff remain for this client."
+      when: cutoff_reached
+
+    - name: Append run-result event for Splunk log file
+      ansible.builtin.set_fact:
+        retention_log_lines: >-
+          {{ retention_log_lines + [ {
+            'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'event_type': 'manual_backfill_run_result',
+            'run_id': run_id,
+            'triggered_by': 'manual',
+            'env_code': env_code,
+            'client_name': client_name,
+            'requested_cutoff': retention_date,
+            'manual_retention_status': ('complete' if cutoff_reached else 'in_progress'),
+            'records_before': (records_before | int),
+            'records_after': (records_after | int),
+            'records_deleted': ((records_before | int) - (records_after | int)),
+            'oldest_before': oldest_before,
+            'oldest_after': oldest_after,
+            'errors': stats_after.json.results.errors
+          } ] }}
+
+    - name: Write jobs/status log events to disk for Universal Forwarder pickup
+      ansible.builtin.copy:
+        dest: "{{ retention_log_dir_jobs }}/{{ run_id }}.log"
+        content: "{{ retention_log_lines | map('to_json') | join('\n') }}\n"
+        mode: "0644"
+
+    - name: Fail the run if the statistics API reported errors
+      ansible.builtin.fail:
+        msg: "Retention statistics API reported errors after the run: {{ stats_after.json.results.errors }}"
+      when: stats_after.json.results.errors | length > 0
