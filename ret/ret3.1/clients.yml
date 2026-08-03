@@ -1,0 +1,48 @@
+---
+# Central retention configuration.
+#
+# stats_time_from is shared by all statistics queries. Keep it earlier than
+# the earliest recording that could exist in the application.
+stats_time_from: "2000-01-01T00:00:00Z"
+
+# Each switch is an operational rollback lever for the hourly statistics job.
+# The two new backlog snapshots are intentionally false for phased rollout.
+# Enable temporary_backlog only after existing Splunk searches filter
+# snapshot_type=overall. Enable policy_backlog only after approved retention-day
+# values are entered and the extra API load is validated in cs_lab.
+hourly_statistics:
+  overall_enabled: true
+  temporary_backlog_enabled: false
+  policy_backlog_enabled: false
+
+# ORDER MATTERS for nightly retention. The first enabled client that still has
+# records before its temporary cutoff receives the one nightly retention job.
+clients:
+  - name: CLIENT9
+    client_id: 1500
+    enabled: true
+    temporary_retention_cutoff_date: "2025-10-01"
+    policy_stats_enabled: false
+    # policy_retention_days: 180  # Add the approved value, then set policy_stats_enabled: true.
+
+  - name: CLIENT12
+    client_id: 1512
+    enabled: true
+    temporary_retention_cutoff_date: "2024-06-15"
+    policy_stats_enabled: false
+    # policy_retention_days: 365  # Example only; replace with the approved requirement.
+
+  - name: CLIENT33
+    client_id: 1533
+    enabled: true
+    temporary_retention_cutoff_date: "2023-01-01"
+    policy_stats_enabled: false
+    # policy_retention_days: 180  # Example only; replace with the approved requirement.
+
+  # New client template:
+  # - name: CLIENTXX
+  #   client_id: 0000
+  #   enabled: false
+  #   temporary_retention_cutoff_date: "YYYY-MM-DD"
+  #   policy_stats_enabled: false
+  #   policy_retention_days: 180

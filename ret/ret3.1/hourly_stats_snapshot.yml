@@ -1,0 +1,282 @@
+---
+# Hourly read-only statistics monitoring for all explicitly enabled clients.
+#
+# The same release can emit up to three snapshot types per client:
+#   overall                     stats_time_from -> captured run time
+#   temporary_retention_backlog stats_time_from -> fixed temporary cutoff
+#   policy_retention_backlog    stats_time_from -> run time minus retention days
+#
+# The policy snapshot is monitoring-only. It never changes the cutoff sent to
+# the retention API. Existing Splunk searches must filter snapshot_type=overall
+# before the additional snapshot types are enabled.
+
+- name: Hourly Statistics Snapshot - All Clients
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - clients.yml
+
+  vars:
+    retention_log_dir_stats: "/logs/gcpg/retention/stats"
+
+  tasks:
+    - name: Validate required release inputs
+      ansible.builtin.assert:
+        that:
+          - cluster_name is defined and cluster_name | length > 0
+          - retention_api_user is defined and retention_api_user | length > 0
+          - retention_api_base is defined and retention_api_base | length > 0
+          - projectid is defined and projectid | length > 0
+          - cir_api_secret is defined and cir_api_secret | length > 0
+          - json_file is defined and json_file | length > 0
+        fail_msg: >-
+          cluster_name, retention_api_user, retention_api_base, projectid,
+          cir_api_secret, and json_file are all required via --extra-vars.
+
+    - name: Capture one UTC epoch for the complete hourly run
+      ansible.builtin.set_fact:
+        stats_run_epoch: "{{ now(utc=true, fmt='%s') | int }}"
+
+    - name: Format the captured run time and build run ID
+      ansible.builtin.set_fact:
+        stats_run_timestamp: >-
+          {{ '%Y-%m-%dT%H:%M:%SZ' | strftime(stats_run_epoch | int, utc=true) }}
+        stats_run_timestamp_compact: >-
+          {{ '%Y%m%dT%H%M%SZ' | strftime(stats_run_epoch | int, utc=true) }}
+
+    - name: Set hourly run ID
+      ansible.builtin.set_fact:
+        run_id: "hourly-{{ cluster_name }}-{{ stats_run_timestamp_compact }}"
+
+    - name: Verify date-math filter direction and UTC behavior on this agent
+      ansible.builtin.assert:
+        that:
+          - "'%Y-%m-%dT%H:%M:%SZ' | strftime(1735689600, utc=true) == '2025-01-01T00:00:00Z'"
+        fail_msg: >-
+          The installed Ansible version does not support the required UTC
+          strftime behavior. Run test_retention_date_math.yml on this agent.
+
+    - name: Validate central statistics configuration
+      ansible.builtin.assert:
+        that:
+          - stats_time_from is defined
+          - stats_time_from is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')
+          - hourly_statistics is defined
+          - hourly_statistics.overall_enabled is defined
+          - hourly_statistics.overall_enabled | type_debug == 'bool'
+          - hourly_statistics.temporary_backlog_enabled is defined
+          - hourly_statistics.temporary_backlog_enabled | type_debug == 'bool'
+          - hourly_statistics.policy_backlog_enabled is defined
+          - hourly_statistics.policy_backlog_enabled | type_debug == 'bool'
+          - clients is defined
+          - clients | length > 0
+        fail_msg: "clients.yml is missing required global statistics configuration."
+
+    - name: Validate every client entry
+      ansible.builtin.assert:
+        that:
+          - client_item.name is defined and client_item.name | length > 0
+          - client_item.client_id is defined
+          - client_item.enabled is defined
+          - client_item.enabled | type_debug == 'bool'
+          - client_item.temporary_retention_cutoff_date is defined
+          - client_item.temporary_retention_cutoff_date is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          - client_item.policy_stats_enabled is defined
+          - client_item.policy_stats_enabled | type_debug == 'bool'
+        fail_msg: "Invalid clients.yml entry: {{ client_item | to_json }}"
+      loop: "{{ clients }}"
+      loop_control:
+        loop_var: client_item
+        label: "{{ client_item.name | default('unknown') }}"
+
+    - name: Validate policy days for clients that enable policy monitoring
+      ansible.builtin.assert:
+        that:
+          - client_item.policy_retention_days is defined
+          - client_item.policy_retention_days | string is match('^[0-9]+$')
+          - client_item.policy_retention_days | int > 0
+        fail_msg: >-
+          {{ client_item.name }} has policy_stats_enabled=true but does not
+          have a valid positive policy_retention_days value.
+      loop: "{{ clients }}"
+      loop_control:
+        loop_var: client_item
+        label: "{{ client_item.name }}"
+      when: client_item.policy_stats_enabled
+
+    - name: Validate client names and IDs are unique
+      ansible.builtin.assert:
+        that:
+          - (clients | map(attribute='name') | list | unique | length) == (clients | length)
+          - (clients | map(attribute='client_id') | list | unique | length) == (clients | length)
+        fail_msg: "Client names and client IDs must be unique in clients.yml."
+
+    - name: Build enabled client lists
+      ansible.builtin.set_fact:
+        active_clients: "{{ clients | selectattr('enabled', 'equalto', true) | list }}"
+        policy_clients: >-
+          {{ clients
+             | selectattr('enabled', 'equalto', true)
+             | selectattr('policy_stats_enabled', 'equalto', true)
+             | list }}
+
+    - name: Validate at least one client is enabled
+      ansible.builtin.assert:
+        that:
+          - active_clients | length > 0
+        fail_msg: "No clients are explicitly enabled in clients.yml."
+
+    - name: Ensure statistics log directory exists
+      ansible.builtin.file:
+        path: "{{ retention_log_dir_stats }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize hourly run state
+      ansible.builtin.set_fact:
+        retention_stats_log_lines: []
+        stats_snapshot_failures: 0
+        hourly_run_failed: false
+        hourly_failure_message: ""
+
+    - name: Run hourly statistics workflow
+      block:
+        - name: Authenticate gcloud
+          ansible.builtin.shell: >-
+            gcloud auth login
+            --cred-file=/shared/config/admin/{{ json_file }}.json
+            --force --quiet
+          changed_when: false
+          no_log: true
+
+        - name: Retrieve retention API password
+          ansible.builtin.shell: >-
+            gcloud secrets versions access latest
+            --secret={{ cir_api_secret }} --project={{ projectid }}
+          register: cir_api_secret_value
+          changed_when: false
+          no_log: true
+
+        - name: Store retention API password
+          ansible.builtin.set_fact:
+            retention_api_password: "{{ cir_api_secret_value.stdout }}"
+          no_log: true
+
+        - name: Validate retrieved password
+          ansible.builtin.assert:
+            that:
+              - retention_api_password | length > 0
+            fail_msg: "Google Secret Manager returned an empty password."
+
+        - name: Pull overall inventory snapshots
+          ansible.builtin.include_tasks: retention_stats_snapshot_one_client.yml
+          loop: "{{ active_clients }}"
+          loop_control:
+            loop_var: client_item
+            label: "{{ client_item.name }} - overall"
+          vars:
+            stats_snapshot_client_name: "{{ client_item.name }}"
+            stats_snapshot_client_id: "{{ client_item.client_id }}"
+            stats_snapshot_type: "overall"
+            stats_snapshot_time_from: "{{ stats_time_from }}"
+            stats_snapshot_time_to: "{{ stats_run_timestamp }}"
+            stats_snapshot_temporary_cutoff_date: "{{ client_item.temporary_retention_cutoff_date }}"
+            stats_snapshot_triggered_by: "hourly-scheduled"
+            stats_snapshot_cluster_name: "{{ cluster_name }}"
+          when: hourly_statistics.overall_enabled
+
+        - name: Pull temporary-retention backlog snapshots
+          ansible.builtin.include_tasks: retention_stats_snapshot_one_client.yml
+          loop: "{{ active_clients }}"
+          loop_control:
+            loop_var: client_item
+            label: "{{ client_item.name }} - temporary backlog"
+          vars:
+            stats_snapshot_client_name: "{{ client_item.name }}"
+            stats_snapshot_client_id: "{{ client_item.client_id }}"
+            stats_snapshot_type: "temporary_retention_backlog"
+            stats_snapshot_time_from: "{{ stats_time_from }}"
+            stats_snapshot_time_to: "{{ client_item.temporary_retention_cutoff_date }}T00:00:00Z"
+            stats_snapshot_temporary_cutoff_date: "{{ client_item.temporary_retention_cutoff_date }}"
+            stats_snapshot_triggered_by: "hourly-scheduled"
+            stats_snapshot_cluster_name: "{{ cluster_name }}"
+          when: hourly_statistics.temporary_backlog_enabled
+
+        - name: Pull rolling-policy backlog snapshots
+          ansible.builtin.include_tasks: retention_stats_snapshot_one_client.yml
+          loop: "{{ policy_clients }}"
+          loop_control:
+            loop_var: client_item
+            label: "{{ client_item.name }} - policy backlog"
+          vars:
+            stats_snapshot_client_name: "{{ client_item.name }}"
+            stats_snapshot_client_id: "{{ client_item.client_id }}"
+            stats_snapshot_type: "policy_retention_backlog"
+            stats_snapshot_time_from: "{{ stats_time_from }}"
+            stats_snapshot_time_to: >-
+              {{ '%Y-%m-%dT%H:%M:%SZ'
+                 | strftime(
+                     (stats_run_epoch | int)
+                     - ((client_item.policy_retention_days | int) * 86400),
+                     utc=true
+                   ) }}
+            stats_snapshot_temporary_cutoff_date: "{{ client_item.temporary_retention_cutoff_date }}"
+            stats_snapshot_policy_retention_days: "{{ client_item.policy_retention_days }}"
+            stats_snapshot_triggered_by: "hourly-scheduled"
+            stats_snapshot_cluster_name: "{{ cluster_name }}"
+          when: hourly_statistics.policy_backlog_enabled
+
+        - name: Append hourly run summary
+          ansible.builtin.set_fact:
+            retention_stats_log_lines: >-
+              {{ retention_stats_log_lines + [ {
+                'event_time': stats_run_timestamp,
+                'event_type': 'hourly_statistics_run_summary',
+                'run_id': run_id,
+                'cluster_name': cluster_name,
+                'enabled_clients': (active_clients | length),
+                'disabled_clients': ((clients | length) - (active_clients | length)),
+                'snapshot_failures': (stats_snapshot_failures | int),
+                'overall_enabled': hourly_statistics.overall_enabled,
+                'temporary_backlog_enabled': hourly_statistics.temporary_backlog_enabled,
+                'policy_backlog_enabled': hourly_statistics.policy_backlog_enabled,
+                'policy_clients_enabled': (policy_clients | length)
+              } ] }}
+
+      rescue:
+        - name: Record hourly workflow failure
+          ansible.builtin.set_fact:
+            hourly_run_failed: true
+            hourly_failure_message: "{{ ansible_failed_result.msg | default('Unknown hourly workflow failure') }}"
+            retention_stats_log_lines: >-
+              {{ retention_stats_log_lines + [ {
+                'event_time': stats_run_timestamp,
+                'event_type': 'hourly_statistics_run_failed',
+                'run_id': run_id,
+                'cluster_name': cluster_name,
+                'failed_task': (ansible_failed_task.name | default('unknown')),
+                'failure_message': (ansible_failed_result.msg | default('Unknown hourly workflow failure'))
+              } ] }}
+
+      always:
+        - name: Write hourly statistics events for Splunk pickup
+          ansible.builtin.copy:
+            dest: "{{ retention_log_dir_stats }}/{{ run_id }}.log"
+            content: "{{ retention_stats_log_lines | map('to_json') | join('\n') }}\n"
+            mode: "0644"
+
+    - name: Fail release after logging any hourly errors
+      ansible.builtin.fail:
+        msg: >-
+          Hourly statistics completed with errors. Workflow failure={{ hourly_run_failed }};
+          snapshot failures={{ stats_snapshot_failures }};
+          message={{ hourly_failure_message | default('none') }}.
+      when: hourly_run_failed or (stats_snapshot_failures | int) > 0
+
+    - name: Hourly statistics complete
+      ansible.builtin.debug:
+        msg: >-
+          Hourly statistics completed for {{ active_clients | length }} enabled
+          client(s). Log: {{ retention_log_dir_stats }}/{{ run_id }}.log

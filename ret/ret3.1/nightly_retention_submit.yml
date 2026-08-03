@@ -1,0 +1,298 @@
+---
+# Nightly temporary-retention submission.
+#
+# Checks every explicitly enabled client in clients.yml, selects the first one
+# in file order that still has records before its fixed temporary cutoff, and
+# submits exactly one retention job. policy_retention_days is monitoring-only
+# and is never used by this playbook.
+#
+# Configure the Azure DevOps retention environment/release queue to allow only
+# one deployment at a time across this release and the manual backfill release.
+# The retention POST intentionally has no retries: an uncertain response must
+# not cause a duplicate destructive submission.
+
+- name: Nightly Retention Job Submission - One Client At A Time
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - clients.yml
+
+  vars:
+    retention_log_dir: "/logs/{{ env_code }}/retention_log"
+    retention_log_dir_jobs: "{{ retention_log_dir }}/jobs"
+    ado_release_id: "{{ lookup('ansible.builtin.env', 'RELEASE_RELEASEID') | default('unknown', true) }}"
+    ado_requested_for: "{{ lookup('ansible.builtin.env', 'RELEASE_DEPLOYMENT_REQUESTEDFOR') | default('unknown', true) }}"
+
+  tasks:
+    - name: Validate required release inputs
+      ansible.builtin.assert:
+        that:
+          - retention_api_user is defined and retention_api_user | length > 0
+          - retention_api_base is defined and retention_api_base | length > 0
+          - env_code is defined and env_code | length > 0
+          - limit is defined and limit | string | length > 0
+          - stop_in_seconds is defined and stop_in_seconds | string | length > 0
+          - simulation_mode is defined and simulation_mode | string | length > 0
+          - projectid is defined and projectid | length > 0
+          - cir_api_secret is defined and cir_api_secret | length > 0
+          - json_file is defined and json_file | length > 0
+        fail_msg: "All documented --extra-vars are required."
+
+    - name: Validate execution-setting shapes
+      ansible.builtin.assert:
+        that:
+          - limit | string is match('^[0-9]+$')
+          - limit | int > 0
+          - stop_in_seconds | string is match('^[0-9]+$')
+          - stop_in_seconds | int > 0
+          - simulation_mode | string | lower in ['true', 'false']
+        fail_msg: >-
+          limit and stop_in_seconds must be positive integers, and
+          simulation_mode must be exactly true or false.
+
+    - name: Capture one timestamp for the nightly run
+      ansible.builtin.set_fact:
+        retention_run_epoch: "{{ now(utc=true, fmt='%s') | int }}"
+
+    - name: Format nightly run timestamp
+      ansible.builtin.set_fact:
+        retention_run_timestamp: >-
+          {{ '%Y-%m-%dT%H:%M:%SZ' | strftime(retention_run_epoch | int, utc=true) }}
+        retention_run_timestamp_compact: >-
+          {{ '%Y%m%dT%H%M%SZ' | strftime(retention_run_epoch | int, utc=true) }}
+
+    - name: Build nightly run ID
+      ansible.builtin.set_fact:
+        run_id: "nightly-{{ env_code }}-{{ retention_run_timestamp_compact }}"
+
+    - name: Ensure jobs log directory exists
+      ansible.builtin.file:
+        path: "{{ retention_log_dir_jobs }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize nightly run state
+      ansible.builtin.set_fact:
+        retention_log_lines: []
+        client_status_list: []
+        nightly_run_failed: false
+        nightly_failure_message: ""
+
+    - name: Run nightly retention workflow
+      block:
+        - name: Validate central and client configuration
+          ansible.builtin.assert:
+            that:
+              - stats_time_from is defined
+              - stats_time_from is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')
+              - clients is defined
+              - clients | length > 0
+            fail_msg: "clients.yml is missing stats_time_from or clients."
+
+        - name: Validate every client entry
+          ansible.builtin.assert:
+            that:
+              - client_item.name is defined and client_item.name | length > 0
+              - client_item.client_id is defined
+              - client_item.enabled is defined
+              - client_item.enabled | type_debug == 'bool'
+              - client_item.temporary_retention_cutoff_date is defined
+              - client_item.temporary_retention_cutoff_date is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+            fail_msg: "Invalid clients.yml entry: {{ client_item | to_json }}"
+          loop: "{{ clients }}"
+          loop_control:
+            loop_var: client_item
+            label: "{{ client_item.name | default('unknown') }}"
+
+        - name: Validate client names and IDs are unique
+          ansible.builtin.assert:
+            that:
+              - (clients | map(attribute='name') | list | unique | length) == (clients | length)
+              - (clients | map(attribute='client_id') | list | unique | length) == (clients | length)
+            fail_msg: "Client names and client IDs must be unique."
+
+        - name: Select explicitly enabled clients
+          ansible.builtin.set_fact:
+            active_clients: "{{ clients | selectattr('enabled', 'equalto', true) | list }}"
+
+        - name: Validate at least one client is enabled
+          ansible.builtin.assert:
+            that:
+              - active_clients | length > 0
+            fail_msg: "No clients are explicitly enabled in clients.yml."
+
+        - name: Authenticate gcloud
+          ansible.builtin.shell: >-
+            gcloud auth login
+            --cred-file=/shared/config/admin/{{ json_file }}.json
+            --force --quiet
+          changed_when: false
+          no_log: true
+
+        - name: Retrieve retention API password
+          ansible.builtin.shell: >-
+            gcloud secrets versions access latest
+            --secret={{ cir_api_secret }} --project={{ projectid }}
+          register: cir_api_secret_value
+          changed_when: false
+          no_log: true
+
+        - name: Store retention API password
+          ansible.builtin.set_fact:
+            retention_api_password: "{{ cir_api_secret_value.stdout }}"
+          no_log: true
+
+        - name: Validate retrieved password
+          ansible.builtin.assert:
+            that:
+              - retention_api_password | length > 0
+            fail_msg: "Google Secret Manager returned an empty password."
+
+        - name: Display simulation mode
+          ansible.builtin.debug:
+            msg: >-
+              simulation_mode={{ simulation_mode }}. Real deletion requires
+              simulation_mode=false in the release variables.
+
+        - name: Check every enabled client in priority order
+          ansible.builtin.include_tasks: retention_check_one_client.yml
+          loop: "{{ active_clients }}"
+          loop_control:
+            loop_var: client_item
+            label: "{{ client_item.name }}"
+
+        - name: Select first enabled client not yet caught up
+          ansible.builtin.set_fact:
+            active_client: >-
+              {{ (client_status_list
+                  | selectattr('caught_up', 'equalto', false)
+                  | list
+                  | first) | default(none) }}
+
+        - name: Report that all enabled clients are caught up
+          ansible.builtin.debug:
+            msg: "All enabled clients have reached their fixed temporary cutoffs."
+          when: active_client is none
+
+        - name: Display tonight's active client
+          ansible.builtin.debug:
+            msg: >-
+              Processing {{ active_client.name }} using fixed temporary cutoff
+              {{ active_client.temporary_cutoff_date }}. Eligible records={{ active_client.eligible_records }};
+              oldest remaining={{ active_client.oldest }}.
+          when: active_client is not none
+
+        - name: Submit one retention job without automatic retry
+          ansible.builtin.uri:
+            url: "{{ retention_api_base }}/retention"
+            method: POST
+            user: "{{ retention_api_user }}"
+            password: "{{ retention_api_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              client_name: "{{ active_client.name }}"
+              "#simulation": "{{ simulation_mode | bool }}"
+              limit: "{{ limit | int }}"
+              retentionTimeOlderThan: "{{ active_client.temporary_cutoff_date }}T00:00:00Z"
+              stopInSeconds: "{{ stop_in_seconds | int }}"
+              numberOfScans: 0
+              responseByJobId: true
+            status_code: 200
+            return_content: true
+          register: active_job
+          when: active_client is not none
+
+        - name: Validate retention submission response
+          ansible.builtin.assert:
+            that:
+              - active_job.json is defined
+              - active_job.json.jobId is defined
+              - active_job.json.jobId | string | length > 0
+              - active_job.json.searchSplunk is defined
+              - active_job.json.statusCode is defined
+            fail_msg: >-
+              The retention POST returned an incomplete response. Do not retry
+              automatically; verify status manually or with the future job-status API.
+          when: active_client is not none
+
+        - name: Append retention submission event
+          ansible.builtin.set_fact:
+            retention_log_lines: >-
+              {{ retention_log_lines + [ {
+                'event_time': retention_run_timestamp,
+                'event_type': 'retention_job_submitted',
+                'run_id': run_id,
+                'triggered_by': 'nightly-scheduled',
+                'env_code': env_code,
+                'client_name': active_client.name,
+                'client_id': active_client.client_id,
+                'manual_retention_status': 'in_progress',
+                'job_id': active_job.json.jobId,
+                'retention_time_older_than': (active_client.temporary_cutoff_date ~ 'T00:00:00Z'),
+                'limit': (limit | int),
+                'stop_in_seconds': (stop_in_seconds | int),
+                'number_of_scans': 0,
+                'simulation_mode': (simulation_mode | bool),
+                'retention_api_base': retention_api_base,
+                'ado_release_id': ado_release_id,
+                'ado_requested_for': ado_requested_for,
+                'search_splunk': active_job.json.searchSplunk,
+                'status_code': active_job.json.statusCode
+              } ] }}
+          when: active_client is not none
+
+        - name: Append nightly run summary
+          ansible.builtin.set_fact:
+            retention_log_lines: >-
+              {{ retention_log_lines + [ {
+                'event_time': retention_run_timestamp,
+                'event_type': 'nightly_run_summary',
+                'run_id': run_id,
+                'triggered_by': 'nightly-scheduled',
+                'env_code': env_code,
+                'configured_clients': (clients | length),
+                'enabled_clients_checked': (active_clients | length),
+                'disabled_clients': ((clients | length) - (active_clients | length)),
+                'active_client': (active_client.name if active_client is not none else 'none'),
+                'manual_retention_status': ('in_progress' if active_client is not none else 'complete'),
+                'job_submitted': (active_client is not none)
+              } ] }}
+
+      rescue:
+        - name: Record nightly workflow failure
+          ansible.builtin.set_fact:
+            nightly_run_failed: true
+            nightly_failure_message: "{{ ansible_failed_result.msg | default('Unknown nightly workflow failure') }}"
+            retention_log_lines: >-
+              {{ retention_log_lines + [ {
+                'event_time': retention_run_timestamp,
+                'event_type': 'nightly_run_failed',
+                'run_id': run_id,
+                'triggered_by': 'nightly-scheduled',
+                'env_code': env_code,
+                'failed_task': (ansible_failed_task.name | default('unknown')),
+                'failure_message': (ansible_failed_result.msg | default('Unknown nightly workflow failure')),
+                'simulation_mode': (simulation_mode | bool)
+              } ] }}
+
+      always:
+        - name: Write nightly events for Splunk pickup
+          ansible.builtin.copy:
+            dest: "{{ retention_log_dir_jobs }}/{{ run_id }}.log"
+            content: "{{ retention_log_lines | map('to_json') | join('\n') }}\n"
+            mode: "0644"
+
+    - name: Fail release after logging a nightly error
+      ansible.builtin.fail:
+        msg: "Nightly retention workflow failed: {{ nightly_failure_message }}"
+      when: nightly_run_failed
+
+    - name: Nightly workflow complete
+      ansible.builtin.debug:
+        msg: >-
+          Nightly workflow completed. Enabled clients checked={{ active_clients | length }};
+          {{ 'one job submitted' if active_client is not none else 'no job submitted' }}.
+          Log={{ retention_log_dir_jobs }}/{{ run_id }}.log

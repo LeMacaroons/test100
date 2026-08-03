@@ -1,0 +1,125 @@
+---
+# Reusable read-only statistics call for one client and one query range.
+#
+# Required caller variables:
+#   stats_snapshot_client_name
+#   stats_snapshot_client_id
+#   stats_snapshot_type                 overall | temporary_retention_backlog | policy_retention_backlog
+#   stats_snapshot_time_from
+#   stats_snapshot_time_to
+#   stats_snapshot_triggered_by
+#   stats_snapshot_cluster_name
+#
+# Optional caller variables:
+#   stats_snapshot_temporary_cutoff_date
+#   stats_snapshot_policy_retention_days
+#
+# A failed snapshot is logged and counted, but this include does not stop the
+# remaining snapshots. The parent hourly playbook writes all events and then
+# fails the release if any snapshot failed.
+
+- name: "{{ stats_snapshot_client_name }} - {{ stats_snapshot_type }} - query statistics"
+  block:
+    - name: "{{ stats_snapshot_client_name }} - {{ stats_snapshot_type }} - call statistics API"
+      ansible.builtin.uri:
+        url: "{{ retention_api_base }}/statistics"
+        method: POST
+        user: "{{ retention_api_user }}"
+        password: "{{ retention_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          client_name: "{{ stats_snapshot_client_name }}"
+          timeFrom: "{{ stats_snapshot_time_from }}"
+          timeTo: "{{ stats_snapshot_time_to }}"
+        status_code: 200
+        return_content: true
+      register: stats_snapshot_result
+
+    - name: "{{ stats_snapshot_client_name }} - {{ stats_snapshot_type }} - validate response shape"
+      ansible.builtin.assert:
+        that:
+          - stats_snapshot_result.json is defined
+          - stats_snapshot_result.json | type_debug == 'dict'
+          - stats_snapshot_result.json.results is defined
+          - stats_snapshot_result.json.results | type_debug == 'dict'
+          - stats_snapshot_result.json.results.voiceRecordsCount is defined
+          - stats_snapshot_result.json.results.voiceRecordsCount.total is defined
+          - stats_snapshot_result.json.results.oldestCallId is defined
+          - stats_snapshot_result.json.results.oldestCallId is none or stats_snapshot_result.json.results.oldestCallId.stopTime is defined
+          - stats_snapshot_result.json.results.audioFiles is defined
+          - stats_snapshot_result.json.results.videoFiles is defined
+          - stats_snapshot_result.json.results.totalDoneTranscriptions is defined
+          - stats_snapshot_result.json.results.errors is defined
+          - stats_snapshot_result.json.results.errors | type_debug == 'list'
+          - stats_snapshot_result.json.results.errors | length == 0
+        fail_msg: >-
+          Statistics response for {{ stats_snapshot_client_name }}
+          ({{ stats_snapshot_type }}) was incomplete or contained errors.
+
+    - name: "{{ stats_snapshot_client_name }} - {{ stats_snapshot_type }} - append success event"
+      ansible.builtin.set_fact:
+        retention_stats_log_lines: >-
+          {{ retention_stats_log_lines + [ {
+            'event_time': stats_run_timestamp,
+            'event_type': 'client_statistics_snapshot',
+            'snapshot_type': stats_snapshot_type,
+            'run_id': run_id,
+            'triggered_by': stats_snapshot_triggered_by,
+            'cluster_name': stats_snapshot_cluster_name,
+            'client_name': stats_snapshot_client_name,
+            'client_id': stats_snapshot_client_id,
+            'query_time_from': stats_snapshot_time_from,
+            'query_time_to': stats_snapshot_time_to,
+            'temporary_retention_cutoff_date': (stats_snapshot_temporary_cutoff_date | default(none)),
+            'policy_retention_days': (stats_snapshot_policy_retention_days | default(none)),
+            'snapshot_status': 'success',
+            'voice_records_total': (stats_snapshot_result.json.results.voiceRecordsCount.total | int),
+            'voice_records_none_delete': (stats_snapshot_result.json.results.voiceRecordsCount.noneDelete | default(0, true) | int),
+            'oldest_call_id': ((stats_snapshot_result.json.results.oldestCallId | default({}, true)).callId | default('none', true)),
+            'oldest_call_stop_time': ((stats_snapshot_result.json.results.oldestCallId | default({}, true)).stopTime | default('none', true)),
+            'audio_files_cloud': (stats_snapshot_result.json.results.audioFiles.numberFilesInCloud | default(0, true) | int),
+            'audio_size_cloud_bytes': (stats_snapshot_result.json.results.audioFiles.totalFilesSizeInCloud | default(0, true) | int),
+            'audio_files_nfs': (stats_snapshot_result.json.results.audioFiles.numberFilesInNfs | default(0, true) | int),
+            'audio_size_nfs_bytes': (stats_snapshot_result.json.results.audioFiles.totalFilesSizeInNfs | default(0, true) | int),
+            'audio_files_total': (stats_snapshot_result.json.results.audioFiles.totalNumberFiles | default(0, true) | int),
+            'audio_size_total_bytes': (stats_snapshot_result.json.results.audioFiles.totalFilesSize | default(0, true) | int),
+            'video_files_cloud': (stats_snapshot_result.json.results.videoFiles.numberFilesInCloud | default(0, true) | int),
+            'video_size_cloud_bytes': (stats_snapshot_result.json.results.videoFiles.totalFilesSizeInCloud | default(0, true) | int),
+            'video_files_nfs': (stats_snapshot_result.json.results.videoFiles.numberFilesInNfs | default(0, true) | int),
+            'video_size_nfs_bytes': (stats_snapshot_result.json.results.videoFiles.totalFilesSizeInNfs | default(0, true) | int),
+            'video_files_total': (stats_snapshot_result.json.results.videoFiles.totalNumberFiles | default(0, true) | int),
+            'video_size_total_bytes': (stats_snapshot_result.json.results.videoFiles.totalFilesSize | default(0, true) | int),
+            'total_transcriptions_done': (stats_snapshot_result.json.results.totalDoneTranscriptions | int),
+            'errors': stats_snapshot_result.json.results.errors
+          } ] }}
+
+  rescue:
+    - name: "{{ stats_snapshot_client_name }} - {{ stats_snapshot_type }} - count failure"
+      ansible.builtin.set_fact:
+        stats_snapshot_failures: "{{ (stats_snapshot_failures | int) + 1 }}"
+        retention_stats_log_lines: >-
+          {{ retention_stats_log_lines + [ {
+            'event_time': stats_run_timestamp,
+            'event_type': 'client_statistics_snapshot_failed',
+            'snapshot_type': stats_snapshot_type,
+            'run_id': run_id,
+            'triggered_by': stats_snapshot_triggered_by,
+            'cluster_name': stats_snapshot_cluster_name,
+            'client_name': stats_snapshot_client_name,
+            'client_id': stats_snapshot_client_id,
+            'query_time_from': stats_snapshot_time_from,
+            'query_time_to': stats_snapshot_time_to,
+            'temporary_retention_cutoff_date': (stats_snapshot_temporary_cutoff_date | default(none)),
+            'policy_retention_days': (stats_snapshot_policy_retention_days | default(none)),
+            'snapshot_status': 'failed',
+            'failed_task': (ansible_failed_task.name | default('unknown')),
+            'failure_message': (ansible_failed_result.msg | default('Unknown statistics failure'))
+          } ] }}
+
+    - name: "{{ stats_snapshot_client_name }} - {{ stats_snapshot_type }} - report failure"
+      ansible.builtin.debug:
+        msg: >-
+          Statistics snapshot failed for {{ stats_snapshot_client_name }}
+          ({{ stats_snapshot_type }}). Remaining snapshots will continue; the
+          hourly release will fail after writing its Splunk log.
