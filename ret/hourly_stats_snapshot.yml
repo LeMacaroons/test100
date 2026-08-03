@@ -6,7 +6,7 @@
 # Purpose: runs on its own independent hourly Azure DevOps schedule
 # (separate release from the nightly job-submission one). Loops through
 # every client in clients.yml and pulls one full, current-state statistics
-# snapshot for each, logging to /apps/retention_log/stats/.
+# snapshot for each, logging to /logs/gcpg/retention/stats/.
 #
 # Deliberately does NOT try to compute before/after or deltas itself - it
 # just logs regular, evenly-spaced readings. Splunk (timechart/delta) is
@@ -24,10 +24,33 @@
 # run every hour (Edit -> Triggers -> Scheduled release trigger -> hourly).
 #
 #   ansible-playbook hourly_stats_snapshot.yml \
-#     --extra-vars "retention_api_user=$(retention_api_user)"
+#     --extra-vars "cluster_name=$(cluster_name) retention_api_user=$(retention_api_user) retention_api_base=$(retention_api_base) projectid=$(projectid) cir_api_secret=$(cir_api_secret) json_file=$(json_file)"
 #
-# Map your SECRET password variable to an environment variable named
-# RETENTION_API_PASSWORD on the task - do not pass it via --extra-vars.
+# --------------------------------------------------------------------------
+# Credential handling - Google Secret Manager:
+# --------------------------------------------------------------------------
+# The retention API password is NOT passed in directly - it's fetched from
+# Google Secret Manager at runtime:
+#   1. gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json
+#   2. gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}
+#
+# json_file identifies which credential file under /shared/config/admin/ to
+# use (filename minus the .json extension) - confirm this convention and the
+# base path match what's actually provisioned on the ADO agent.
+#
+# Both the auth task and the secret-fetch task use `no_log: true` so the
+# credential file handling and the secret VALUE itself never appear in
+# Ansible's console/verbose output. Do not remove no_log from either task,
+# and do not add any debug task that prints retention_api_password.
+#
+# NOTE: cluster_name, retention_api_user, retention_api_base, projectid,
+# cir_api_secret, and json_file are all required with no defaults, and are
+# NOT redeclared as self-assignments in the vars: block (e.g. NOT
+# `projectid: "{{ projectid }}"`) - Ansible cannot safely do
+# `foo: "{{ foo }}"` when foo isn't already supplied externally; that
+# causes a recursive-template error, and would even break this file's own
+# validation task. Extra-vars are already directly usable without
+# redeclaring them.
 #
 # --------------------------------------------------------------------------
 # Scaling consideration:
@@ -48,25 +71,25 @@
     - clients.yml
 
   vars:
-    retention_api_base: "https://rwsgreen3.ggg.com/sir/api/v1/ctrl"
-    retention_api_user: "{{ retention_api_user }}"
-    retention_api_password: "{{ lookup('ansible.builtin.env', 'RETENTION_API_PASSWORD') }}"
-
-    retention_log_dir: "/apps/retention_log"
-    retention_log_dir_stats: "{{ retention_log_dir }}/stats"
+    retention_log_dir_stats: "/logs/gcpg/retention/stats"
     run_timestamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
-    run_id: "hourly-{{ run_timestamp }}"
+    run_id: "hourly-{{ cluster_name }}-{{ run_timestamp }}"
 
   tasks:
 
-    - name: Validate credentials are present
+    - name: Validate GCP config, user, and cluster_name are present
       ansible.builtin.assert:
         that:
+          - cluster_name is defined and cluster_name | length > 0
           - retention_api_user is defined and retention_api_user | length > 0
-          - retention_api_password | length > 0
+          - retention_api_base is defined and retention_api_base | length > 0
+          - projectid is defined and projectid | length > 0
+          - cir_api_secret is defined and cir_api_secret | length > 0
+          - json_file is defined and json_file | length > 0
         fail_msg: >
-          Missing retention_api_user (--extra-vars) or RETENTION_API_PASSWORD
-          (environment variable on the task).
+          Missing cluster_name, retention_api_user, retention_api_base,
+          projectid, cir_api_secret, or json_file (all via --extra-vars).
+          None of these have defaults - all must be explicitly supplied.
 
     - name: Validate a client list was loaded
       ansible.builtin.assert:
@@ -74,6 +97,33 @@
           - clients is defined
           - clients | length > 0
         fail_msg: "clients.yml did not load, or the clients list is empty."
+
+    # ------------------------------------------------------------------
+    # Authenticate to Google Cloud, then fetch the retention API password
+    # from Secret Manager. no_log is mandatory on both tasks below - do
+    # not remove it, and do not add a debug task that prints the result.
+    # ------------------------------------------------------------------
+    - name: auth gcloud
+      ansible.builtin.shell: "gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json --force --quiet"
+      changed_when: false
+      no_log: true
+
+    - name: get password
+      ansible.builtin.shell: "gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}"
+      register: cir_api_secret_value
+      changed_when: false
+      no_log: true
+
+    - name: Set retention_api_password from the retrieved secret
+      ansible.builtin.set_fact:
+        retention_api_password: "{{ cir_api_secret_value.stdout }}"
+      no_log: true
+
+    - name: Validate the password was actually retrieved
+      ansible.builtin.assert:
+        that:
+          - retention_api_password | length > 0
+        fail_msg: "Retrieved an empty password from Google Secret Manager - check cir_api_secret and projectid."
 
     - name: Ensure stats log directory exists
       ansible.builtin.file:
@@ -93,7 +143,9 @@
         label: "{{ client_item.name }}"
       vars:
         stats_snapshot_client_name: "{{ client_item.name }}"
+        stats_snapshot_client_id: "{{ client_item.client_id }}"
         stats_snapshot_triggered_by: "hourly-scheduled"
+        stats_snapshot_cluster_name: "{{ cluster_name }}"
 
     - name: Write statistics snapshots to disk for Universal Forwarder pickup
       ansible.builtin.copy:
@@ -104,5 +156,6 @@
     - name: Done
       ansible.builtin.debug:
         msg: >
-          Hourly statistics snapshot complete for {{ clients | length }} client(s).
+          Hourly statistics snapshot complete for cluster {{ cluster_name }},
+          {{ clients | length }} client(s).
           Log: {{ retention_log_dir_stats }}/{{ run_id }}.log
