@@ -1,0 +1,290 @@
+---
+# ============================================================================
+# Nightly Retention Job Submission - ONE Client At A Time, In Priority Order
+# ============================================================================
+#
+# Purpose: runs on a nightly Azure DevOps schedule. Processes clients.yml
+# strictly in order, one client at a time:
+#   1. Check every client's current status (cheap, read-only) - gives a full
+#      status report in the logs every night, even for clients not yet
+#      touched.
+#   2. Find the FIRST client (in file order) that has not yet reached their
+#      target cutoff date.
+#   3. Submit exactly ONE retention job, for that one client only. Every
+#      client listed after it waits untouched, regardless of their own
+#      status, until the ones ahead of them are fully caught up.
+#   4. If everyone is already caught up, submit nothing and say so.
+#
+# This is deliberately fire-and-forget for the submitted job: no waiting, no
+# before/after comparison. Results are checked the next morning via the
+# Splunk dashboard, not by this playbook.
+#
+# Why one at a time: avoids any client permanently monopolizing the server's
+# nightly processing window (10pm-6am, or whatever the developers have
+# configured) at the expense of clients listed after them, regardless of
+# whether the server can run multiple clients' jobs concurrently or not.
+# Slower overall (each client fully finishes before the next one starts) but
+# predictable and fair by construction.
+#
+# --------------------------------------------------------------------------
+# Wiring into an Azure DevOps Classic Release, scheduled nightly:
+# --------------------------------------------------------------------------
+# 1. Release pipeline -> Edit -> Triggers -> "Scheduled release trigger" ->
+#    turn on, pick a time (e.g. 1:00 AM) and days (every day), pick timezone.
+# 2. Add an Ansible/Bash task running:
+#
+#      ansible-playbook nightly_retention_submit.yml \
+#        --extra-vars "retention_api_user=$(retention_api_user) retention_api_base=$(retention_api_base) env_code=$(env_code) limit=$(limit) stop_in_seconds=$(stop_in_seconds) simulation_mode=$(simulation_mode)"
+#
+#    Map your SECRET password variable to an environment variable named
+#    RETENTION_API_PASSWORD on the task - do not pass it via --extra-vars.
+#
+# 3. clients.yml lives alongside this playbook (checked into the same repo)
+#    and defines both the client list AND their processing priority order.
+#    Reorder it to change priority; edit cutoff dates via normal PR/review.
+#
+# --------------------------------------------------------------------------
+# All operational parameters below are REQUIRED, with no defaults:
+# --------------------------------------------------------------------------
+#   env_code           - environment/cluster code, used to build the log path
+#                        (e.g. "blue", "orange", "gcp_cluster1a") - see note
+#                        on cluster_name vs env_code below.
+#   limit              - records per scan (e.g. 500)
+#   stop_in_seconds     - how long the retention job may run, in seconds
+#   simulation_mode     - true/false - dry run vs real delete. NO DEFAULT:
+#                         must be explicitly passed every run. This is a
+#                         deliberate change - a missing value now fails the
+#                         play loudly instead of silently defaulting to a
+#                         dry run, so nobody mistakes "forgot to set it" for
+#                         "intentionally testing."
+#   retention_api_base  - retention API base URL, in case a given cluster
+#                         has its own separate endpoint.
+#
+# NOTE: cluster_name is used by the separate hourly_stats_snapshot.yml
+# playbook to tag statistics events; env_code is used here to build the log
+# path. Confirm whether these should actually be the same value passed
+# under one name, or are genuinely different - as of this writing they are
+# two separate variables across the two playbooks.
+#
+# --------------------------------------------------------------------------
+# stop_in_seconds consideration:
+# --------------------------------------------------------------------------
+# The server enforces its own processing window (reported as 10pm-6am,
+# hardcoded on their side - confirm the exact bounds with the dev team). If
+# stop_in_seconds is set longer than the remaining time in that window, the
+# job will get cut off by the server's window regardless of what we pass.
+# Consider setting this close to (but not exceeding) that window's length,
+# e.g. ~28000 seconds for an 8-hour window, so the job wraps up on its own
+# terms rather than being abruptly cut off by the server's own boundary.
+#
+# --------------------------------------------------------------------------
+# Splunk visibility - structured JSON log output:
+# --------------------------------------------------------------------------
+# This run writes ONE new file per execution to retention_log_dir_jobs
+# (/logs/{{ env_code }}/retention_log/jobs/), named "{{ run_id }}.log". Each
+# line is a standalone JSON object: one per client status-checked, one for
+# the job actually submitted (if any), and one run-summary line.
+#
+# General backlog/storage TRENDING is intentionally NOT done here - see
+# hourly_stats_snapshot.yml, a separate independently-scheduled playbook
+# that logs a full statistics snapshot for every client on its own hourly
+# cadence. Splunk (timechart/delta) computes trends from that regular time
+# series rather than this playbook trying to capture before/after itself -
+# this keeps this playbook fast and decouples sampling frequency from when
+# jobs happen to run.
+#
+# Point a Universal Forwarder monitor stanza at each subfolder with a
+# JSON-aware sourcetype (e.g. sourcetype=_json, or a custom sourcetype with
+# KV_MODE=json) - Splunk will auto-extract every field with no regex needed,
+# unlike the other retention log sources this dashboard is built on.
+#
+# A new file per run (rather than one continuously-appended file) avoids any
+# in-place file modification, which keeps this simple and safe for the
+# forwarder's CRC-based file tracking.
+# ============================================================================
+
+- name: Nightly Retention Job Submission - One Client At A Time
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - clients.yml
+
+  vars:
+    retention_api_password: "{{ lookup('ansible.builtin.env', 'RETENTION_API_PASSWORD') }}"
+
+    # Splunk log output - derived from env_code, which must come in via
+    # --extra-vars (validated below). Not redeclared here as a plain
+    # self-assignment, since that pattern recurses infinitely if the value
+    # isn't actually supplied - see the note further up.
+    retention_log_dir: "/logs/{{ env_code }}/retention_log"
+    retention_log_dir_jobs: "{{ retention_log_dir }}/jobs"
+    run_timestamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+    run_id: "nightly-{{ env_code }}-{{ run_timestamp }}"
+
+    # Verify these environment variable names against your actual ADO task
+    # environment - names shown are typical but not guaranteed for your setup.
+    # Falls back to 'unknown' rather than failing if the name is wrong.
+    ado_release_id: "{{ lookup('ansible.builtin.env', 'RELEASE_RELEASEID') | default('unknown', true) }}"
+    ado_requested_for: "{{ lookup('ansible.builtin.env', 'RELEASE_DEPLOYMENT_REQUESTEDFOR') | default('unknown', true) }}"
+
+  tasks:
+
+    - name: Validate all required inputs are present (no defaults - everything must be supplied)
+      ansible.builtin.assert:
+        that:
+          - retention_api_user is defined and retention_api_user | length > 0
+          - retention_api_password | length > 0
+          - retention_api_base is defined and retention_api_base | length > 0
+          - env_code is defined and env_code | length > 0
+          - limit is defined and limit | string | length > 0
+          - stop_in_seconds is defined and stop_in_seconds | string | length > 0
+          - simulation_mode is defined and simulation_mode | string | length > 0
+        fail_msg: >
+          Missing one or more required inputs: retention_api_user,
+          RETENTION_API_PASSWORD (environment variable, not an extra-var),
+          retention_api_base, env_code, limit, stop_in_seconds, or
+          simulation_mode. None of these have defaults - all must be
+          explicitly supplied via --extra-vars (except the password).
+
+    - name: Validate a client list was loaded
+      ansible.builtin.assert:
+        that:
+          - clients is defined
+          - clients | length > 0
+        fail_msg: "clients.yml did not load, or the clients list is empty."
+
+    - name: NOTE on simulation mode (a silent no-op trap if left true on a real schedule)
+      ansible.builtin.debug:
+        msg: >
+          simulation_mode is {{ simulation_mode }}. If this nightly run is meant to
+          actually delete data, simulation_mode must be explicitly set to false in
+          the Release pipeline variables - otherwise tonight's run (and every
+          night's run) is a harmless dry run and nothing will actually be deleted.
+
+    - name: Ensure retention log directory exists
+      ansible.builtin.file:
+        path: "{{ retention_log_dir_jobs }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize the log-line accumulator for this run
+      ansible.builtin.set_fact:
+        retention_log_lines: []
+
+    # ------------------------------------------------------------------
+    # Phase 1: check EVERY client's status, in priority order. Read-only.
+    # ------------------------------------------------------------------
+    - name: Check status of every client, in priority order (read-only)
+      ansible.builtin.include_tasks: retention_check_one_client.yml
+      loop: "{{ clients }}"
+      loop_control:
+        loop_var: client_item
+        label: "{{ client_item.name }}"
+
+    # ------------------------------------------------------------------
+    # Phase 2: find the first client in priority order not yet caught up,
+    # and submit a job for that ONE client only.
+    # ------------------------------------------------------------------
+    - name: Determine tonight's active client - first in priority order not yet caught up
+      ansible.builtin.set_fact:
+        active_client: "{{ (client_status_list | selectattr('caught_up', 'equalto', false) | list | first) | default(none) }}"
+
+    - name: All clients are caught up - nothing to submit tonight
+      ansible.builtin.debug:
+        msg: "All configured clients have reached their target cutoff date. manual_retention_status: complete for everyone."
+      when: active_client is none
+
+    - name: "Tonight's active client identified"
+      ansible.builtin.debug:
+        msg: >
+          Processing {{ active_client.name }} tonight (target cutoff {{ active_client.cutoff_date }},
+          oldest remaining call currently {{ active_client.oldest }}, manual_retention_status: in_progress). All clients
+          ahead of this one in clients.yml are already complete; all clients after it will wait their turn.
+      when: active_client is not none
+
+    - name: Submit retention job for tonight's active client
+      ansible.builtin.uri:
+        url: "{{ retention_api_base }}/retention"
+        method: POST
+        user: "{{ retention_api_user }}"
+        password: "{{ retention_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          client_name: "{{ active_client.name }}"
+          "#simulation": "{{ simulation_mode | bool }}"
+          limit: "{{ limit | int }}"
+          retentionTimeOlderThan: "{{ active_client.cutoff_date }}T00:00:00Z"
+          stopInSeconds: "{{ stop_in_seconds | int }}"
+          numberOfScans: 0
+          responseByJobId: true
+        status_code: 200
+        return_content: true
+      register: active_job
+      when: active_client is not none
+
+    - name: Log submitted job
+      ansible.builtin.debug:
+        msg: >
+          Submitted job {{ active_job.json.jobId }} for {{ active_client.name }}.
+          Splunk search: {{ active_job.json.searchSplunk }}
+      when: active_client is not none
+
+    - name: Append job-submission event for Splunk log file
+      ansible.builtin.set_fact:
+        retention_log_lines: >-
+          {{ retention_log_lines + [ {
+            'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'event_type': 'retention_job_submitted',
+            'run_id': run_id,
+            'triggered_by': 'nightly-scheduled',
+            'env_code': env_code,
+            'client_name': active_client.name,
+            'client_id': active_client.client_id,
+            'manual_retention_status': 'in_progress',
+            'job_id': active_job.json.jobId,
+            'retention_time_older_than': (active_client.cutoff_date ~ 'T00:00:00Z'),
+            'limit': (limit | int),
+            'stop_in_seconds': (stop_in_seconds | int),
+            'number_of_scans': 0,
+            'simulation_mode': (simulation_mode | bool),
+            'retention_api_base': retention_api_base,
+            'ado_release_id': ado_release_id,
+            'ado_requested_for': ado_requested_for,
+            'search_splunk': active_job.json.searchSplunk,
+            'status_code': active_job.json.statusCode
+          } ] }}
+      when: active_client is not none
+
+    - name: Append run-summary event for Splunk log file
+      ansible.builtin.set_fact:
+        retention_log_lines: >-
+          {{ retention_log_lines + [ {
+            'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'event_type': 'nightly_run_summary',
+            'run_id': run_id,
+            'triggered_by': 'nightly-scheduled',
+            'env_code': env_code,
+            'clients_checked': (clients | length),
+            'active_client': (active_client.name if active_client is not none else 'none'),
+            'manual_retention_status': ('in_progress' if active_client is not none else 'complete'),
+            'job_submitted': (active_client is not none)
+          } ] }}
+
+    - name: Write jobs/status log events to disk for Universal Forwarder pickup
+      ansible.builtin.copy:
+        dest: "{{ retention_log_dir_jobs }}/{{ run_id }}.log"
+        content: "{{ retention_log_lines | map('to_json') | join('\n') }}\n"
+        mode: "0644"
+
+    - name: Done - reminder to check the Splunk dashboard in the morning
+      ansible.builtin.debug:
+        msg: >
+          Nightly pass complete for env_code={{ env_code }}. Checked {{ clients | length }}
+          client(s) in priority order;
+          {{ 'submitted one job (see above)' if active_client is not none else 'submitted nothing - all caught up' }}.
+          Job log: {{ retention_log_dir_jobs }}/{{ run_id }}.log.
+          Check the retention pipeline dashboard tomorrow morning for job completion, duration,
+          errors, and backlog-age progress (the hourly statistics snapshot feeds backlog/storage trends).
