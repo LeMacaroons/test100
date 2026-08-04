@@ -1,0 +1,42 @@
+---
+# Run this once on the same Azure DevOps agent used by the Classic Release:
+#   ansible-playbook test_retention_date_math.yml
+
+- name: Validate retention date math on release agent
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    known_epoch: 1735689600
+    retention_days: 180
+
+  tasks:
+    - name: Format known UTC epoch using documented strftime direction
+      ansible.builtin.set_fact:
+        known_timestamp: >-
+          {{ '%Y-%m-%dT%H:%M:%SZ' | strftime(known_epoch | int, utc=true) }}
+
+    - name: Calculate rolling cutoff from the same known epoch
+      ansible.builtin.set_fact:
+        calculated_cutoff: >-
+          {{ '%Y-%m-%dT%H:%M:%SZ'
+             | strftime(
+                 (known_epoch | int) - ((retention_days | int) * 86400),
+                 utc=true
+               ) }}
+
+    - name: Assert known results
+      ansible.builtin.assert:
+        that:
+          - known_timestamp == '2025-01-01T00:00:00Z'
+          - calculated_cutoff == '2024-07-05T00:00:00Z'
+        fail_msg: >-
+          Date math failed on this agent. Confirm ansible-core supports
+          ansible.builtin.strftime with utc=true before deploying.
+
+    - name: Display successful test values
+      ansible.builtin.debug:
+        msg:
+          - "Known timestamp: {{ known_timestamp }}"
+          - "180-day cutoff: {{ calculated_cutoff }}"
