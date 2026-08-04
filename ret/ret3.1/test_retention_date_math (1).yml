@@ -1,6 +1,13 @@
 ---
 # Run this once on the same Azure DevOps agent used by the Classic Release:
-#   ansible-playbook test_retention_date_math.yml
+#
+#   ansible-playbook -i localhost, -c local test_retention_date_math.yml -vv
+#
+# This playbook:
+#   1. Verifies a known epoch converts to the expected UTC timestamp.
+#   2. Verifies subtracting 180 days produces the expected date.
+#   3. Tests the calculation using the current time.
+#   4. Writes the results to retention_date_math_test_output.json.
 
 - name: Validate retention date math on release agent
   hosts: localhost
@@ -10,33 +17,110 @@
   vars:
     known_epoch: 1735689600
     retention_days: 180
+    test_output_file: "{{ playbook_dir }}/retention_date_math_test_output.json"
 
   tasks:
-    - name: Format known UTC epoch using documented strftime direction
+    - name: Announce date-math test startup
+      ansible.builtin.debug:
+        msg: "Starting retention date-math validation on {{ inventory_hostname }}"
+
+    - name: Display installed Ansible version
+      ansible.builtin.debug:
+        msg: "Ansible core version: {{ ansible_version.full }}"
+
+    - name: Format known UTC epoch
       ansible.builtin.set_fact:
         known_timestamp: >-
-          {{ '%Y-%m-%dT%H:%M:%SZ' | strftime(known_epoch | int, utc=true) }}
+          {{
+            '%Y-%m-%dT%H:%M:%SZ'
+            | strftime(known_epoch | int, utc=true)
+          }}
 
-    - name: Calculate rolling cutoff from the same known epoch
+    - name: Calculate rolling cutoff from known epoch
       ansible.builtin.set_fact:
         calculated_cutoff: >-
-          {{ '%Y-%m-%dT%H:%M:%SZ'
-             | strftime(
-                 (known_epoch | int) - ((retention_days | int) * 86400),
-                 utc=true
-               ) }}
+          {{
+            '%Y-%m-%dT%H:%M:%SZ'
+            | strftime(
+                (known_epoch | int)
+                - ((retention_days | int) * 86400),
+                utc=true
+              )
+          }}
 
-    - name: Assert known results
+    - name: Validate known date-math results
       ansible.builtin.assert:
         that:
           - known_timestamp == '2025-01-01T00:00:00Z'
           - calculated_cutoff == '2024-07-05T00:00:00Z'
         fail_msg: >-
-          Date math failed on this agent. Confirm ansible-core supports
-          ansible.builtin.strftime with utc=true before deploying.
+          Date math failed on this agent. Confirm the installed ansible-core
+          version supports ansible.builtin.strftime with utc=true.
+        success_msg: "Known epoch and 180-day cutoff calculations passed."
 
-    - name: Display successful test values
+    - name: Capture current UTC epoch once
+      ansible.builtin.set_fact:
+        live_run_epoch: "{{ now(utc=true, fmt='%s') | int }}"
+
+    - name: Format current run timestamp
+      ansible.builtin.set_fact:
+        live_run_timestamp: >-
+          {{
+            '%Y-%m-%dT%H:%M:%SZ'
+            | strftime(live_run_epoch | int, utc=true)
+          }}
+
+    - name: Calculate live rolling policy cutoff
+      ansible.builtin.set_fact:
+        live_policy_cutoff: >-
+          {{
+            '%Y-%m-%dT%H:%M:%SZ'
+            | strftime(
+                (live_run_epoch | int)
+                - ((retention_days | int) * 86400),
+                utc=true
+              )
+          }}
+
+    - name: Validate live date-math results
+      ansible.builtin.assert:
+        that:
+          - live_run_epoch | int > 0
+          - live_run_timestamp is match(
+              '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+            )
+          - live_policy_cutoff is match(
+              '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+            )
+        fail_msg: "The live UTC timestamp or rolling cutoff is invalid."
+
+    - name: Write date-math test results to JSON file
+      ansible.builtin.copy:
+        dest: "{{ test_output_file }}"
+        mode: "0644"
+        content: >-
+          {{
+            {
+              'status': 'passed',
+              'ansible_core_version': ansible_version.full,
+              'known_epoch': known_epoch | int,
+              'known_timestamp': known_timestamp,
+              'retention_days': retention_days | int,
+              'known_rolling_cutoff': calculated_cutoff,
+              'live_run_epoch': live_run_epoch | int,
+              'live_run_timestamp': live_run_timestamp,
+              'live_policy_cutoff': live_policy_cutoff
+            }
+            | to_nice_json
+          }}
+
+    - name: Display successful test results
       ansible.builtin.debug:
         msg:
+          - "TEST STATUS: PASSED"
+          - "Ansible version: {{ ansible_version.full }}"
           - "Known timestamp: {{ known_timestamp }}"
-          - "180-day cutoff: {{ calculated_cutoff }}"
+          - "Known 180-day cutoff: {{ calculated_cutoff }}"
+          - "Current run timestamp: {{ live_run_timestamp }}"
+          - "Current 180-day cutoff: {{ live_policy_cutoff }}"
+          - "Result file: {{ test_output_file }}"
