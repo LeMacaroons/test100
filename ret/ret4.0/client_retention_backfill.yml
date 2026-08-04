@@ -1,0 +1,321 @@
+---
+# PACKAGE VERSION: latest-verified-v3-2026-08-04-1550ET
+# DATE MATH: Python 3.6 UTC calculations; no dependency on the newer Ansible UTC filter argument.
+# Manual one-client temporary-retention backfill.
+#
+# Required --extra-vars:
+#   client_name retention_api_user retention_api_base env_code limit
+#   stop_in_seconds simulation_mode projectid cir_api_secret json_file
+# Optional:
+#   retention_date=YYYY-MM-DD  (explicit temporary-cutoff override)
+#
+# The client must exist in clients.yml and be explicitly enabled. The retention
+# POST intentionally has no retries. Configure Azure DevOps to serialize this
+# release with the nightly retention release.
+
+- name: Client Data Retention - Manual Backfill
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - clients.yml
+
+  vars:
+    retention_log_dir: "/logs/{{ env_code }}/retention_log"
+    retention_log_dir_jobs: "{{ retention_log_dir }}/jobs"
+    ado_release_id: "{{ lookup('env', 'RELEASE_RELEASEID') | default('unknown', true) }}"
+    ado_requested_for: "{{ lookup('env', 'RELEASE_DEPLOYMENT_REQUESTEDFOR') | default('unknown', true) }}"
+
+  tasks:
+    - name: Validate required release inputs
+      assert:
+        that:
+          - client_name is defined and client_name | length > 0
+          - retention_api_user is defined and retention_api_user | length > 0
+          - retention_api_base is defined and retention_api_base | length > 0
+          - env_code is defined and env_code | length > 0
+          - limit is defined and limit | string | length > 0
+          - stop_in_seconds is defined and stop_in_seconds | string | length > 0
+          - simulation_mode is defined and simulation_mode | string | length > 0
+          - projectid is defined and projectid | length > 0
+          - cir_api_secret is defined and cir_api_secret | length > 0
+          - json_file is defined and json_file | length > 0
+        fail_msg: "All documented --extra-vars except retention_date are required."
+
+    - name: Validate execution-setting shapes
+      assert:
+        that:
+          - limit | string is match('^[0-9]+$')
+          - limit | int > 0
+          - stop_in_seconds | string is match('^[0-9]+$')
+          - stop_in_seconds | int > 0
+          - simulation_mode | string | lower in ['true', 'false']
+          - retention_date is not defined or retention_date | length == 0 or retention_date is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        fail_msg: >-
+          limit and stop_in_seconds must be positive integers,
+          simulation_mode must be true or false, and retention_date must be YYYY-MM-DD.
+
+    - name: Capture one UTC clock for the manual run using Python 3
+      command: >-
+        python3 -c "import json,time,datetime; e=int(time.time());
+        d=datetime.datetime.utcfromtimestamp(e);
+        print(json.dumps({'epoch':e,
+        'timestamp':d.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'compact':d.strftime('%Y%m%dT%H%M%SZ')}))"
+      register: retention_run_clock_command
+      changed_when: false
+
+    - name: Parse the captured manual UTC clock
+      set_fact:
+        retention_run_clock: "{{ retention_run_clock_command.stdout | from_json }}"
+
+    - name: Set manual run timestamps and run ID
+      set_fact:
+        retention_run_epoch: "{{ retention_run_clock.epoch | int }}"
+        retention_run_timestamp: "{{ retention_run_clock.timestamp }}"
+        retention_run_timestamp_compact: "{{ retention_run_clock.compact }}"
+        run_id: "manual-{{ client_name }}-{{ retention_run_clock.compact }}"
+
+    - name: Validate the captured manual UTC clock
+      assert:
+        that:
+          - retention_run_epoch | int > 0
+          - retention_run_timestamp is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')
+          - retention_run_timestamp_compact is match('^[0-9]{8}T[0-9]{6}Z$')
+        fail_msg: >-
+          Python 3 did not return a valid UTC timestamp. Confirm python3 is
+          available on the Azure DevOps agent.
+
+    - name: Ensure jobs log directory exists
+      file:
+        path: "{{ retention_log_dir_jobs }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize manual run state
+      set_fact:
+        retention_log_lines: []
+        manual_run_failed: false
+        manual_failure_message: ""
+
+    - name: Run manual retention workflow
+      block:
+        - name: Validate central configuration
+          assert:
+            that:
+              - stats_time_from is defined
+              - stats_time_from is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')
+              - clients is defined
+              - clients | length > 0
+            fail_msg: "clients.yml is missing stats_time_from or clients."
+
+        - name: Find selected client in clients.yml
+          set_fact:
+            matched_client: >-
+              {{ (clients
+                  | selectattr('name', 'equalto', client_name)
+                  | list
+                  | first) | default(none) }}
+
+        - name: Require selected client to exist in clients.yml
+          assert:
+            that:
+              - matched_client is not none
+            fail_msg: "{{ client_name }} was not found in clients.yml."
+
+        - name: Require selected client to be explicitly enabled and valid
+          assert:
+            that:
+              - matched_client.enabled is defined
+              - matched_client.enabled | type_debug == 'bool'
+              - matched_client.enabled
+              - matched_client.client_id is defined
+              - matched_client.temporary_retention_cutoff_date is defined
+              - matched_client.temporary_retention_cutoff_date is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+            fail_msg: >-
+              {{ client_name }} must have enabled=true, client_id, and a valid
+              temporary_retention_cutoff_date in clients.yml.
+
+        - name: Resolve effective temporary cutoff
+          set_fact:
+            effective_retention_date: >-
+              {{ retention_date
+                 if (retention_date is defined and retention_date | length > 0)
+                 else matched_client.temporary_retention_cutoff_date }}
+            effective_client_id: "{{ matched_client.client_id }}"
+
+        - name: Validate effective temporary cutoff
+          assert:
+            that:
+              - effective_retention_date is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+            fail_msg: "The effective temporary cutoff must use YYYY-MM-DD."
+
+        - name: Warn when manual cutoff overrides clients.yml
+          debug:
+            msg: >-
+              Explicit retention_date={{ retention_date }} overrides configured
+              temporary_retention_cutoff_date={{ matched_client.temporary_retention_cutoff_date }}
+              for this manual run only.
+          when:
+            - retention_date is defined
+            - retention_date | length > 0
+            - retention_date != matched_client.temporary_retention_cutoff_date
+
+        - name: Build full temporary cutoff timestamp
+          set_fact:
+            retention_cutoff_timestamp: "{{ effective_retention_date }}T00:00:00Z"
+
+        - name: Authenticate gcloud
+          shell: >-
+            gcloud auth login
+            --cred-file=/shared/config/admin/{{ json_file }}.json
+            --force --quiet
+          changed_when: false
+          no_log: true
+
+        - name: Retrieve retention API password
+          shell: >-
+            gcloud secrets versions access latest
+            --secret={{ cir_api_secret }} --project={{ projectid }}
+          register: cir_api_secret_value
+          changed_when: false
+          no_log: true
+
+        - name: Store retention API password
+          set_fact:
+            retention_api_password: "{{ cir_api_secret_value.stdout }}"
+          no_log: true
+
+        - name: Validate retrieved password
+          assert:
+            that:
+              - retention_api_password | length > 0
+            fail_msg: "Google Secret Manager returned an empty password."
+
+        - name: Get BEFORE temporary-backlog statistics
+          uri:
+            url: "{{ retention_api_base }}/statistics"
+            method: POST
+            user: "{{ retention_api_user }}"
+            password: "{{ retention_api_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              client_name: "{{ client_name }}"
+              timeFrom: "{{ stats_time_from }}"
+              timeTo: "{{ retention_cutoff_timestamp }}"
+            status_code: 200
+            return_content: true
+          register: stats_before
+
+        - name: Validate BEFORE statistics response
+          assert:
+            that:
+              - stats_before.json is defined
+              - stats_before.json.results is defined
+              - stats_before.json.results.voiceRecordsCount.total is defined
+              - stats_before.json.results.oldestCallId is defined
+              - stats_before.json.results.oldestCallId is none or stats_before.json.results.oldestCallId.stopTime is defined
+              - stats_before.json.results.errors is defined
+              - stats_before.json.results.errors | type_debug == 'list'
+              - stats_before.json.results.errors | length == 0
+            fail_msg: "BEFORE statistics response was incomplete or contained errors."
+
+        - name: Submit manual retention job without automatic retry
+          uri:
+            url: "{{ retention_api_base }}/retention"
+            method: POST
+            user: "{{ retention_api_user }}"
+            password: "{{ retention_api_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              client_name: "{{ client_name }}"
+              "#simulation": "{{ simulation_mode | bool }}"
+              limit: "{{ limit | int }}"
+              retentionTimeOlderThan: "{{ retention_cutoff_timestamp }}"
+              stopInSeconds: "{{ stop_in_seconds | int }}"
+              numberOfScans: 0
+              responseByJobId: true
+            status_code: 200
+            return_content: true
+          register: retention_start
+
+        - name: Validate retention submission response
+          assert:
+            that:
+              - retention_start.json is defined
+              - retention_start.json.jobId is defined
+              - retention_start.json.jobId | string | length > 0
+              - retention_start.json.searchSplunk is defined
+              - retention_start.json.statusCode is defined
+            fail_msg: >-
+              Retention POST returned an incomplete response. Do not retry
+              automatically; verify the job manually or with the future status API.
+
+        - name: Append manual submission event
+          set_fact:
+            retention_log_lines: >-
+              {{ retention_log_lines + [ {
+                'event_time': retention_run_timestamp,
+                'event_type': 'retention_job_submitted',
+                'run_id': run_id,
+                'triggered_by': 'manual',
+                'env_code': env_code,
+                'ado_release_id': ado_release_id,
+                'ado_requested_for': ado_requested_for,
+                'client_name': client_name,
+                'client_id': effective_client_id,
+                'job_id': retention_start.json.jobId,
+                'statistics_time_from': stats_time_from,
+                'retention_time_older_than': retention_cutoff_timestamp,
+                'limit': (limit | int),
+                'stop_in_seconds': (stop_in_seconds | int),
+                'number_of_scans': 0,
+                'simulation_mode': (simulation_mode | bool),
+                'retention_api_base': retention_api_base,
+                'search_splunk': retention_start.json.searchSplunk,
+                'status_code': retention_start.json.statusCode
+              } ] }}
+
+        - name: Display manual submission summary
+          debug:
+            msg:
+              - "Client: {{ client_name }}"
+              - "Temporary cutoff: {{ retention_cutoff_timestamp }}"
+              - "Simulation mode: {{ simulation_mode }}"
+              - "Job ID: {{ retention_start.json.jobId }}"
+              - "Eligible records at submission: {{ stats_before.json.results.voiceRecordsCount.total | int }}"
+              - "Oldest eligible call at submission: {{ (stats_before.json.results.oldestCallId | default({}, true)).stopTime | default('none', true) }}"
+              - "The release is not waiting for completion; monitor hourly statistics or the future job-status API."
+
+      rescue:
+        - name: Record manual workflow failure
+          set_fact:
+            manual_run_failed: true
+            manual_failure_message: "{{ ansible_failed_result.msg | default('Unknown manual workflow failure') }}"
+            retention_log_lines: >-
+              {{ retention_log_lines + [ {
+                'event_time': retention_run_timestamp,
+                'event_type': 'manual_backfill_run_failed',
+                'run_id': run_id,
+                'triggered_by': 'manual',
+                'env_code': env_code,
+                'client_name': client_name,
+                'failed_task': (ansible_failed_task.name | default('unknown')),
+                'failure_message': (ansible_failed_result.msg | default('Unknown manual workflow failure')),
+                'simulation_mode': (simulation_mode | bool)
+              } ] }}
+
+      always:
+        - name: Write manual events for Splunk pickup
+          copy:
+            dest: "{{ retention_log_dir_jobs }}/{{ run_id }}.log"
+            content: "{{ retention_log_lines | map('to_json') | join('\n') }}\n"
+            mode: "0644"
+
+    - name: Fail release after logging a manual error
+      fail:
+        msg: "Manual retention workflow failed: {{ manual_failure_message }}"
+      when: manual_run_failed

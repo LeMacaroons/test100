@@ -1,0 +1,90 @@
+---
+# PACKAGE VERSION: latest-verified-v3-2026-08-04-1550ET
+# DATE MATH: Python 3.6 UTC calculations; no dependency on the newer Ansible UTC filter argument.
+# Compatibility test for older Ansible installations.
+#
+# This test deliberately avoids:
+#   now(utc=true, fmt='%s')
+#   strftime(..., utc=true)
+#
+# UTC date calculation is delegated to Python 3.6, which is already installed
+# on the RHEL Azure DevOps agent.
+#
+# Output file:
+#   /tmp/retention_date_math_test_output.json
+
+- name: Validate Python-based retention date math
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    known_epoch: 1735689600
+    retention_days: 180
+    test_output_file: /tmp/retention_date_math_test_output.json
+
+  tasks:
+    - name: Create initial test result file
+      copy:
+        dest: "{{ test_output_file }}"
+        mode: "0644"
+        content: |
+          {
+            "status": "started",
+            "message": "Retention date-math test started"
+          }
+
+    - name: Run UTC date calculations with Python 3.6-compatible code
+      command: >-
+        python3 -c "import json,time,datetime;
+        k={{ known_epoch | int }};
+        d={{ retention_days | int }};
+        n=int(time.time());
+        print(json.dumps({
+        'known_timestamp':datetime.datetime.utcfromtimestamp(k).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'known_rolling_cutoff':datetime.datetime.utcfromtimestamp(k-(d*86400)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'live_run_epoch':n,
+        'live_run_timestamp':datetime.datetime.utcfromtimestamp(n).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'live_policy_cutoff':datetime.datetime.utcfromtimestamp(n-(d*86400)).strftime('%Y-%m-%dT%H:%M:%SZ')}))"
+      register: date_math_command
+      changed_when: false
+
+    - name: Parse Python date-math output
+      set_fact:
+        date_math_result: "{{ date_math_command.stdout | from_json }}"
+
+    - name: Validate known date-math results
+      assert:
+        that:
+          - date_math_result.known_timestamp == '2025-01-01T00:00:00Z'
+          - date_math_result.known_rolling_cutoff == '2024-07-05T00:00:00Z'
+          - date_math_result.live_run_epoch | int > 0
+        fail_msg: Python-based UTC date math returned unexpected values.
+
+    - name: Write successful test results
+      copy:
+        dest: "{{ test_output_file }}"
+        mode: "0644"
+        content: >-
+          {{ {
+            'status': 'passed',
+            'ansible_version': ansible_version.full,
+            'python_version_required': '3.6+',
+            'retention_days': retention_days | int,
+            'known_timestamp': date_math_result.known_timestamp,
+            'known_rolling_cutoff': date_math_result.known_rolling_cutoff,
+            'live_run_epoch': date_math_result.live_run_epoch | int,
+            'live_run_timestamp': date_math_result.live_run_timestamp,
+            'live_policy_cutoff': date_math_result.live_policy_cutoff
+          } | to_nice_json }}
+
+    - name: Display successful test results
+      debug:
+        msg:
+          - "TEST STATUS: PASSED"
+          - "Ansible version: {{ ansible_version.full }}"
+          - "Known timestamp: {{ date_math_result.known_timestamp }}"
+          - "Known 180-day cutoff: {{ date_math_result.known_rolling_cutoff }}"
+          - "Current run timestamp: {{ date_math_result.live_run_timestamp }}"
+          - "Current 180-day cutoff: {{ date_math_result.live_policy_cutoff }}"
+          - "Result file: {{ test_output_file }}"

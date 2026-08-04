@@ -1,0 +1,98 @@
+---
+# PACKAGE VERSION: latest-verified-v3-2026-08-04-1550ET
+# DATE MATH: Python 3.6 UTC calculations; no dependency on the newer Ansible UTC filter argument.
+# Read-only nightly status check for one enabled client. A malformed or
+# error-bearing response fails the nightly workflow; it is never interpreted
+# as "caught up".
+
+- name: "{{ client_item.name }} - query temporary-retention backlog"
+  uri:
+    url: "{{ retention_api_base }}/statistics"
+    method: POST
+    user: "{{ retention_api_user }}"
+    password: "{{ retention_api_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      client_name: "{{ client_item.name }}"
+      timeFrom: "{{ stats_time_from }}"
+      timeTo: "{{ client_item.temporary_retention_cutoff_date }}T00:00:00Z"
+    status_code: 200
+    return_content: true
+  register: client_stats
+
+- name: "{{ client_item.name }} - validate statistics response"
+  assert:
+    that:
+      - client_stats.json is defined
+      - client_stats.json | type_debug == 'dict'
+      - client_stats.json.results is defined
+      - client_stats.json.results | type_debug == 'dict'
+      - client_stats.json.results.voiceRecordsCount is defined
+      - client_stats.json.results.voiceRecordsCount.total is defined
+      - client_stats.json.results.oldestCallId is defined
+      - client_stats.json.results.oldestCallId is none or client_stats.json.results.oldestCallId.stopTime is defined
+      - client_stats.json.results.errors is defined
+      - client_stats.json.results.errors | type_debug == 'list'
+      - client_stats.json.results.errors | length == 0
+    fail_msg: >-
+      Statistics response for {{ client_item.name }} was incomplete or
+      contained errors. No retention job will be submitted.
+
+- name: "{{ client_item.name }} - extract oldest remaining call"
+  set_fact:
+    client_oldest: >-
+      {{ (client_stats.json.results.oldestCallId | default({}, true)).stopTime
+         | default('none', true) }}
+
+- name: "{{ client_item.name }} - determine temporary cleanup status"
+  set_fact:
+    client_caught_up: >-
+      {{ (
+        (client_oldest == 'none')
+        or (client_oldest[:10] >= client_item.temporary_retention_cutoff_date)
+      ) | bool }}
+
+- name: "{{ client_item.name }} - set explicit status"
+  set_fact:
+    client_manual_retention_status: "{{ 'complete' if client_caught_up else 'in_progress' }}"
+
+- name: "{{ client_item.name }} - record status"
+  set_fact:
+    client_status_list: >-
+      {{ client_status_list + [ {
+        'name': client_item.name,
+        'client_id': client_item.client_id,
+        'temporary_cutoff_date': client_item.temporary_retention_cutoff_date,
+        'oldest': client_oldest,
+        'eligible_records': (client_stats.json.results.voiceRecordsCount.total | int),
+        'caught_up': client_caught_up,
+        'manual_retention_status': client_manual_retention_status
+      } ] }}
+
+- name: "{{ client_item.name }} - display status"
+  debug:
+    msg: >-
+      {{ client_item.name }}: eligible records={{ client_stats.json.results.voiceRecordsCount.total }},
+      oldest remaining={{ client_oldest }}, temporary cutoff={{ client_item.temporary_retention_cutoff_date }},
+      status={{ client_manual_retention_status }}.
+
+- name: "{{ client_item.name }} - append status event"
+  set_fact:
+    retention_log_lines: >-
+      {{ retention_log_lines + [ {
+        'event_time': retention_run_timestamp,
+        'event_type': 'client_status_check',
+        'run_id': run_id,
+        'triggered_by': 'nightly-scheduled',
+        'env_code': env_code,
+        'client_name': client_item.name,
+        'client_id': client_item.client_id,
+        'query_time_from': stats_time_from,
+        'query_time_to': (client_item.temporary_retention_cutoff_date ~ 'T00:00:00Z'),
+        'temporary_retention_cutoff_date': client_item.temporary_retention_cutoff_date,
+        'eligible_records': (client_stats.json.results.voiceRecordsCount.total | int),
+        'oldest_remaining_call': client_oldest,
+        'manual_retention_status': client_manual_retention_status,
+        'caught_up': client_caught_up
+      } ] }}
