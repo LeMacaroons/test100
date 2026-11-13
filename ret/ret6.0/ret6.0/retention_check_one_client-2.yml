@@ -1,0 +1,123 @@
+---
+# ============================================================================
+# Check ONE client's current status against their target cutoff.
+# Read-only - does NOT submit a retention job. Included in a loop by
+# nightly_retention_submit.yml, once per client in clients.yml, to build a
+# full status picture before deciding which single client gets tonight's job.
+#
+# Appends a result to client_status_list:
+#   { name, client_id, cutoff_date, oldest, caught_up, check_ok, check_error,
+#     manual_retention_status }
+#
+# Per-client error handling: if this client's statistics call fails (HTTP
+# error, timeout, non-zero statusCode, missing results), the failure is
+# caught here, the client is recorded with check_ok=false and
+# manual_retention_status='error', and the loop CONTINUES to the next client.
+# One bad client no longer aborts the whole nightly run. The calling playbook
+# skips errored clients when choosing tonight's job, and fails the run at the
+# very end (after logs are written) so the problem is visible in ADO.
+#
+# client_id comes directly from clients.yml (hardcoded, authoritative) -
+# NOT extracted from the API response, since the API only exposes it when
+# there's a remaining call before the cutoff (null for a caught-up client).
+#
+# Requires from the calling play: retention_api_base, retention_api_user,
+# retention_api_password, api_timeout_seconds, run_id, client_item.
+# ============================================================================
+
+- name: "{{ client_item.name }} - check status (errors are caught per client)"
+  block:
+    - name: "{{ client_item.name }} - get current statistics"
+      ansible.builtin.uri:
+        url: "{{ retention_api_base }}/statistics"
+        method: POST
+        user: "{{ retention_api_user }}"
+        password: "{{ retention_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          client_name: "{{ client_item.name }}"
+          timeFrom: "2000-01-01T00:00:00Z"
+          timeTo: "{{ client_item.retention_cutoff_date }}T00:00:00Z"
+        status_code: 200
+        return_content: true
+        timeout: "{{ api_timeout_seconds | int }}"
+      register: client_stats
+
+    - name: "{{ client_item.name }} - validate the statistics response"
+      ansible.builtin.assert:
+        that:
+          - client_stats.json is defined
+          - client_stats.json.statusCode is defined
+          - (client_stats.json.statusCode | int) == 0
+          - client_stats.json.results is defined
+          - client_stats.json.results is mapping
+        fail_msg: >-
+          Statistics API returned an unexpected response for {{ client_item.name }}:
+          statusCode={{ client_stats.json.statusCode | default('missing') }},
+          statusMessage={{ client_stats.json.statusMessage | default('missing') }}
+        quiet: true
+
+    - name: "{{ client_item.name }} - extract oldest remaining call date (null-safe)"
+      ansible.builtin.set_fact:
+        client_oldest: "{{ (client_stats.json.results.oldestCallId | default({}, true)).stopTime | default('none', true) }}"
+
+    - name: "{{ client_item.name }} - determine if caught up (date-only string comparison)"
+      ansible.builtin.set_fact:
+        client_caught_up: "{{ (client_oldest == 'none') or (client_oldest[:10] >= client_item.retention_cutoff_date) }}"
+        client_check_ok: true
+        client_check_error: ""
+
+  rescue:
+    - name: "{{ client_item.name }} - statistics check FAILED, recording error and continuing"
+      ansible.builtin.set_fact:
+        client_oldest: "unknown"
+        client_caught_up: false
+        client_check_ok: false
+        client_check_error: "{{ (ansible_failed_result.msg | default('unknown error') | string)[:500] }}"
+
+- name: "{{ client_item.name }} - set explicit manual retention status"
+  ansible.builtin.set_fact:
+    client_manual_retention_status: >-
+      {{ 'error' if not (client_check_ok | bool)
+         else ('complete' if (client_caught_up | bool) else 'in_progress') }}
+
+- name: "{{ client_item.name }} - record status"
+  ansible.builtin.set_fact:
+    client_status_list: >-
+      {{ (client_status_list | default([])) + [ {
+        'name': client_item.name,
+        'client_id': client_item.client_id,
+        'cutoff_date': client_item.retention_cutoff_date,
+        'oldest': client_oldest,
+        'caught_up': (client_caught_up | bool),
+        'check_ok': (client_check_ok | bool),
+        'check_error': client_check_error,
+        'manual_retention_status': client_manual_retention_status
+      } ] }}
+
+- name: "{{ client_item.name }} - status"
+  ansible.builtin.debug:
+    msg: >
+      {{ client_item.name }}: oldest remaining call = {{ client_oldest }},
+      target cutoff = {{ client_item.retention_cutoff_date }},
+      manual_retention_status = {{ client_manual_retention_status }}
+      {{ ('- ERROR: ' ~ client_check_error) if not (client_check_ok | bool) else '' }}
+
+- name: "{{ client_item.name }} - append status-check event for Splunk log file"
+  ansible.builtin.set_fact:
+    retention_log_lines: >-
+      {{ (retention_log_lines | default([])) + [ {
+        'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'event_type': 'client_status_check',
+        'run_id': run_id,
+        'triggered_by': 'nightly-scheduled',
+        'client_name': client_item.name,
+        'client_id': client_item.client_id,
+        'target_cutoff_date': client_item.retention_cutoff_date,
+        'oldest_remaining_call': client_oldest,
+        'manual_retention_status': client_manual_retention_status,
+        'caught_up': (client_caught_up | bool),
+        'check_ok': (client_check_ok | bool),
+        'check_error': client_check_error
+      } ] }}

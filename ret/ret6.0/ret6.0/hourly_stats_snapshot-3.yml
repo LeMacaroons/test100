@@ -1,0 +1,224 @@
+---
+# ============================================================================
+# Hourly Statistics Snapshot - All Clients
+# ============================================================================
+#
+# Purpose: runs on its own independent hourly Azure DevOps schedule
+# (separate release from the nightly job-submission one). Loops through
+# every client in clients.yml and pulls one full, current-state statistics
+# snapshot for each, logging to /logs/gcpg/retention/stats/.
+#
+# Deliberately does NOT try to compute before/after or deltas itself - it
+# just logs regular, evenly-spaced readings. Splunk (timechart/delta) is
+# what figures out rate of change, backlog draining speed, growth/shrink
+# trends, etc. from the resulting time series.
+#
+# --------------------------------------------------------------------------
+# Error handling (added 2026-11-13):
+# --------------------------------------------------------------------------
+# - A failed statistics call for one client (HTTP error, timeout, non-zero
+#   statusCode) is caught per client and logged as event_type
+#   'client_statistics_error'. The loop continues, so every other client is
+#   still captured that hour.
+# - The log file is always written first; then, if any client errored, the
+#   run is marked FAILED so it shows red in ADO.
+# - Every event for this run carries the same run_id (fixed once with
+#   set_fact - a now()-based run_id in vars: would drift between events).
+#
+# --------------------------------------------------------------------------
+# Wiring into Azure DevOps Classic Release, scheduled hourly:
+# --------------------------------------------------------------------------
+# This should be its OWN Release pipeline/definition, separate from the
+# nightly job-submission one, with its own Scheduled release trigger set to
+# run every hour (Edit -> Triggers -> Scheduled release trigger -> hourly).
+#
+#   ansible-playbook hourly_stats_snapshot.yml \
+#     --extra-vars "cluster_name=$(cluster_name) retention_api_user=$(retention_api_user) retention_api_base=$(retention_api_base) projectid=$(projectid) cir_api_secret=$(cir_api_secret) json_file=$(json_file)"
+#
+# Fixed internal settings (in vars: below; override with --extra-vars only
+# if needed):
+#   api_timeout_seconds - how long to wait for each statistics call (300)
+#   log_retention_days  - this playbook deletes its own old log files
+#                         (hourly-*.log) older than this many days (30)
+#
+# --------------------------------------------------------------------------
+# Credential handling - Google Secret Manager:
+# --------------------------------------------------------------------------
+# The retention API password is NOT passed in directly - it's fetched from
+# Google Secret Manager at runtime:
+#   1. gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json
+#   2. gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}
+#
+# Both commands run against a PRIVATE, per-run gcloud config directory
+# (CLOUDSDK_CONFIG pointed at a temp dir) that is deleted right after the
+# password is fetched, so `gcloud auth login --force` doesn't switch the
+# active account for other pipelines on the same ADO agent.
+#
+# Both gcloud tasks use `no_log: true`. Do not remove no_log from either
+# task, and do not add any debug task that prints retention_api_password.
+#
+# NOTE: cluster_name, retention_api_user, retention_api_base, projectid,
+# cir_api_secret, and json_file are all required with no defaults, and are
+# NOT redeclared as self-assignments in the vars: block (e.g. NOT
+# `projectid: "{{ projectid }}"`) - that causes a recursive-template error,
+# and would even break this file's own validation task.
+#
+# --------------------------------------------------------------------------
+# Scaling consideration:
+# --------------------------------------------------------------------------
+# This calls the statistics API once per client, every hour. Fine for a
+# handful of clients; if the client list grows large, consider a coarser
+# interval (every 2-4 hours).
+# ============================================================================
+
+- name: Hourly Statistics Snapshot - All Clients
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - clients.yml
+
+  vars:
+    retention_log_dir_stats: "/logs/gcpg/retention/stats"
+
+    # Fixed internal settings - see header.
+    api_timeout_seconds: 300
+    log_retention_days: 30
+
+  tasks:
+
+    - name: Validate GCP config, user, and cluster_name are present
+      ansible.builtin.assert:
+        that:
+          - cluster_name is defined and cluster_name | length > 0
+          - retention_api_user is defined and retention_api_user | length > 0
+          - retention_api_base is defined and retention_api_base | length > 0
+          - projectid is defined and projectid | length > 0
+          - cir_api_secret is defined and cir_api_secret | length > 0
+          - json_file is defined and json_file | length > 0
+        fail_msg: >
+          Missing cluster_name, retention_api_user, retention_api_base,
+          projectid, cir_api_secret, or json_file (all via --extra-vars).
+          None of these have defaults - all must be explicitly supplied.
+
+    - name: Validate a client list was loaded
+      ansible.builtin.assert:
+        that:
+          - clients is defined
+          - clients | length > 0
+        fail_msg: "clients.yml did not load, or the clients list is empty."
+
+    - name: Fix this run's ID once, so every event and the log filename share it
+      ansible.builtin.set_fact:
+        run_id: "hourly-{{ cluster_name }}-{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+
+    # ------------------------------------------------------------------
+    # Authenticate to Google Cloud and fetch the retention API password,
+    # using a private per-run gcloud config dir that is always deleted
+    # afterwards. no_log is mandatory on the gcloud tasks.
+    # ------------------------------------------------------------------
+    - name: Fetch the retention API password from Google Secret Manager (isolated gcloud config)
+      block:
+        - name: Create a private, per-run gcloud config directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: "retention_gcloud_"
+          register: gcloud_config_dir
+
+        - name: auth gcloud
+          ansible.builtin.shell: "gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json --force --quiet"
+          environment:
+            CLOUDSDK_CONFIG: "{{ gcloud_config_dir.path }}"
+          changed_when: false
+          no_log: true
+
+        - name: get password
+          ansible.builtin.shell: "gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}"
+          environment:
+            CLOUDSDK_CONFIG: "{{ gcloud_config_dir.path }}"
+          register: cir_api_secret_value
+          changed_when: false
+          no_log: true
+
+      always:
+        - name: Remove the per-run gcloud config directory (it holds a login token)
+          ansible.builtin.file:
+            path: "{{ gcloud_config_dir.path }}"
+            state: absent
+          when: gcloud_config_dir.path is defined
+
+    - name: Set retention_api_password from the retrieved secret
+      ansible.builtin.set_fact:
+        retention_api_password: "{{ cir_api_secret_value.stdout }}"
+      no_log: true
+
+    - name: Validate the password was actually retrieved
+      ansible.builtin.assert:
+        that:
+          - retention_api_password | length > 0
+        fail_msg: "Retrieved an empty password from Google Secret Manager - check cir_api_secret and projectid."
+
+    - name: Ensure stats log directory exists
+      ansible.builtin.file:
+        path: "{{ retention_log_dir_stats }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize accumulators for this run
+      ansible.builtin.set_fact:
+        retention_stats_log_lines: []
+        retention_stats_errored_clients: []
+
+    - name: Pull statistics snapshot for every client (a failure for one client does not stop the loop)
+      ansible.builtin.include_tasks: retention_stats_snapshot_one_client.yml
+      loop: "{{ clients }}"
+      loop_control:
+        loop_var: client_item
+        label: "{{ client_item.name }}"
+      vars:
+        stats_snapshot_client_name: "{{ client_item.name }}"
+        stats_snapshot_client_id: "{{ client_item.client_id }}"
+        stats_snapshot_triggered_by: "hourly-scheduled"
+        stats_snapshot_cluster_name: "{{ cluster_name }}"
+
+    - name: Write statistics snapshots to disk for Universal Forwarder pickup
+      ansible.builtin.copy:
+        dest: "{{ retention_log_dir_stats }}/{{ run_id }}.log"
+        content: "{{ retention_stats_log_lines | map('to_json') | join('\n') }}\n"
+        mode: "0644"
+
+    # ------------------------------------------------------------------
+    # Housekeeping: delete this playbook's own log files older than
+    # log_retention_days. Only touches hourly-*.log in this directory.
+    # ------------------------------------------------------------------
+    - name: Find old hourly log files
+      ansible.builtin.find:
+        paths: "{{ retention_log_dir_stats }}"
+        patterns: "hourly-*.log"
+        age: "{{ log_retention_days }}d"
+      register: old_hourly_logs
+
+    - name: Delete old hourly log files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_hourly_logs.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >
+          Hourly statistics snapshot complete for cluster {{ cluster_name }}:
+          {{ (clients | length) - (retention_stats_errored_clients | length) }} of
+          {{ clients | length }} client(s) captured.
+          Log: {{ retention_log_dir_stats }}/{{ run_id }}.log
+
+    - name: Fail the run if any client's statistics call failed
+      ansible.builtin.fail:
+        msg: >
+          Statistics call failed for: {{ retention_stats_errored_clients | join(', ') }}
+          (other clients were captured and the log was written; see the
+          client_statistics_error events for details).
+      when: retention_stats_errored_clients | length > 0

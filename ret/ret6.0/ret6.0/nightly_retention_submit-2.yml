@@ -1,0 +1,458 @@
+---
+# ============================================================================
+# Nightly Retention Job Submission - ONE Client At A Time, In Priority Order
+# ============================================================================
+#
+# Purpose: runs on a nightly Azure DevOps schedule. Processes clients.yml
+# strictly in order, one client at a time:
+#   1. Check every client's current status (cheap, read-only) - gives a full
+#      status report in the logs every night, even for clients not yet
+#      touched.
+#   2. Find the FIRST client (in file order) that has not yet reached their
+#      target cutoff date.
+#   3. Submit exactly ONE retention job, for that one client only. Every
+#      client listed after it waits untouched, regardless of their own
+#      status, until the ones ahead of them are fully caught up.
+#   4. If everyone is already caught up, submit nothing and say so.
+#
+# This is deliberately fire-and-forget for the submitted job: no waiting, no
+# before/after comparison. Results are checked the next morning via the
+# Splunk dashboard, not by this playbook.
+#
+# Why one at a time: avoids any client permanently monopolizing the server's
+# nightly processing window (10pm-6am, or whatever the developers have
+# configured) at the expense of clients listed after them, regardless of
+# whether the server can run multiple clients' jobs concurrently or not.
+# Slower overall (each client fully finishes before the next one starts) but
+# predictable and fair by construction. This works because cutoff dates are
+# FIXED: once a client reaches its date it stays caught up. (A rolling
+# window would break this queue - that is planned inside the application,
+# not through this API.)
+#
+# --------------------------------------------------------------------------
+# Error handling (added 2026-11-13):
+# --------------------------------------------------------------------------
+# - A failed status check for one client (HTTP error, timeout, non-zero
+#   statusCode) is caught per client. That client is logged with
+#   manual_retention_status='error' and skipped for tonight; the queue moves
+#   on to the next eligible client so one broken client can't stall
+#   everyone. The run is then marked FAILED at the very end, after logs are
+#   written, so it shows red in ADO.
+# - The job submission checks the response: statusCode 0 plus a jobId means
+#   accepted. Anything else (or an HTTP error/timeout) is logged as
+#   event_type 'retention_job_rejected' and the run is marked FAILED.
+# - Every log event for this run carries the same run_id (fixed once at the
+#   start with set_fact - play vars are re-templated on every use, so a
+#   now()-based run_id in vars: would drift between events).
+#
+# --------------------------------------------------------------------------
+# Wiring into an Azure DevOps Classic Release, scheduled nightly:
+# --------------------------------------------------------------------------
+# 1. Release pipeline -> Edit -> Triggers -> "Scheduled release trigger" ->
+#    turn on, pick a time (e.g. 1:00 AM) and days (every day), pick timezone.
+# 2. Add an Ansible/Bash task running:
+#
+#      ansible-playbook nightly_retention_submit.yml \
+#        --extra-vars "retention_api_user=$(retention_api_user) retention_api_base=$(retention_api_base) env_code=$(env_code) limit=$(limit) stop_in_seconds=$(stop_in_seconds) simulation_mode=$(simulation_mode) projectid=$(projectid) cir_api_secret=$(cir_api_secret) json_file=$(json_file)"
+#
+#    The retention API password is fetched from Google Secret Manager at
+#    runtime (see below) - nothing password-related needs to be set as a
+#    task-level environment variable or Release secret variable here.
+#
+# 3. clients.yml lives alongside this playbook (checked into the same repo)
+#    and defines both the client list AND their processing priority order.
+#    Reorder it to change priority; edit cutoff dates via normal PR/review.
+#
+# --------------------------------------------------------------------------
+# All operational parameters below are REQUIRED, with no defaults:
+# --------------------------------------------------------------------------
+#   env_code           - environment/cluster code, used to build the log path
+#                        (e.g. "blue", "orange", "gcp_cluster1a") - see note
+#                        on cluster_name vs env_code below.
+#   limit              - records per scan (e.g. 500)
+#   stop_in_seconds     - how long the retention job may run, in seconds
+#   simulation_mode     - true/false - dry run vs real delete. Always false
+#                         in practice (confirmed 2026-11-13), but must still
+#                         be passed explicitly every run.
+#   retention_api_base  - retention API base URL, in case a given cluster
+#                         has its own separate endpoint.
+#   projectid           - GCP project ID for Secret Manager
+#   cir_api_secret      - name of the secret holding the retention API password
+#   json_file           - credential file identifier (filename minus .json)
+#                         under /shared/config/admin/, used to auth to GCP
+#
+# Fixed internal settings (in vars: below; override with --extra-vars only
+# if needed):
+#   api_timeout_seconds - how long to wait for each API call (300)
+#   log_retention_days  - this playbook deletes its own old log files
+#                         (nightly-*.log) older than this many days (30)
+#
+# The retention API password is NOT passed in directly - it's fetched from
+# Google Secret Manager at runtime:
+#   1. gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json
+#   2. gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}
+#
+# Both gcloud commands run against a PRIVATE, per-run gcloud config
+# directory (CLOUDSDK_CONFIG pointed at a temp dir), which is deleted right
+# after the password is fetched. This keeps `gcloud auth login --force` from
+# switching the active account for every other pipeline on the same ADO
+# agent, and keeps the login token from lingering on disk.
+#
+# Both gcloud tasks use `no_log: true` so the credential file handling and
+# the secret VALUE itself never appear in Ansible's console/verbose output.
+# Do not remove no_log from either task, and do not add any debug task that
+# prints retention_api_password.
+#
+# NOTE: required extra-vars are NOT redeclared in vars: as self-assignments
+# (e.g. NOT `env_code: "{{ env_code }}"`) - that pattern causes a
+# recursive-template crash when the value isn't supplied. Only genuinely
+# derived values belong in vars:.
+#
+# NOTE: cluster_name is used by the separate hourly_stats_snapshot.yml
+# playbook to tag statistics events; env_code is used here to build the log
+# path. They are confirmed to be genuinely different values.
+#
+# --------------------------------------------------------------------------
+# stop_in_seconds consideration:
+# --------------------------------------------------------------------------
+# The server enforces its own processing window (reported as 10pm-6am,
+# hardcoded on their side - confirm the exact bounds with the dev team). If
+# stop_in_seconds is set longer than the remaining time in that window, the
+# job will get cut off by the server's window regardless of what we pass.
+# Consider setting this close to (but not exceeding) that window's length,
+# e.g. ~28000 seconds for an 8-hour window, so the job wraps up on its own
+# terms rather than being abruptly cut off by the server's own boundary.
+#
+# --------------------------------------------------------------------------
+# Splunk visibility - structured JSON log output:
+# --------------------------------------------------------------------------
+# This run writes ONE new file per execution to retention_log_dir_jobs
+# (/logs/{{ env_code }}/retention_log/jobs/), named "{{ run_id }}.log". Each
+# line is a standalone JSON object: one per client status-checked, one for
+# the job submitted or rejected (if any), and one run-summary line.
+#
+# General backlog/storage TRENDING is intentionally NOT done here - see
+# hourly_stats_snapshot.yml, a separate independently-scheduled playbook.
+#
+# Point a Universal Forwarder monitor stanza at each subfolder with a
+# JSON-aware sourcetype (e.g. sourcetype=_json, or a custom sourcetype with
+# KV_MODE=json) - Splunk will auto-extract every field with no regex needed.
+#
+# A new file per run (rather than one continuously-appended file) avoids any
+# in-place file modification, which keeps this simple and safe for the
+# forwarder's CRC-based file tracking.
+# ============================================================================
+
+- name: Nightly Retention Job Submission - One Client At A Time
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - clients.yml
+
+  vars:
+    # Splunk log output - derived from env_code, which must come in via
+    # --extra-vars (validated below).
+    retention_log_dir: "/logs/{{ env_code }}/retention_log"
+    retention_log_dir_jobs: "{{ retention_log_dir }}/jobs"
+
+    # Fixed internal settings - see header.
+    api_timeout_seconds: 300
+    log_retention_days: 30
+
+    # Predefined ADO classic-release variables, exposed to tasks as
+    # environment variables. Falls back to 'unknown' rather than failing.
+    ado_release_id: "{{ lookup('ansible.builtin.env', 'RELEASE_RELEASEID') | default('unknown', true) }}"
+    ado_requested_for: "{{ lookup('ansible.builtin.env', 'RELEASE_DEPLOYMENT_REQUESTEDFOR') | default('unknown', true) }}"
+
+  tasks:
+
+    - name: Validate all required inputs are present (no defaults - everything must be supplied)
+      ansible.builtin.assert:
+        that:
+          - retention_api_user is defined and retention_api_user | length > 0
+          - retention_api_base is defined and retention_api_base | length > 0
+          - env_code is defined and env_code | length > 0
+          - limit is defined and limit | string | length > 0
+          - stop_in_seconds is defined and stop_in_seconds | string | length > 0
+          - simulation_mode is defined and simulation_mode | string | length > 0
+          - projectid is defined and projectid | length > 0
+          - cir_api_secret is defined and cir_api_secret | length > 0
+          - json_file is defined and json_file | length > 0
+        fail_msg: >
+          Missing one or more required inputs: retention_api_user,
+          retention_api_base, env_code, limit, stop_in_seconds,
+          simulation_mode, projectid, cir_api_secret, or json_file. None of
+          these have defaults - all must be explicitly supplied via
+          --extra-vars.
+
+    - name: Fix this run's ID once, so every event and the log filename share it
+      ansible.builtin.set_fact:
+        run_id: "nightly-{{ env_code }}-{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+
+    # ------------------------------------------------------------------
+    # Authenticate to Google Cloud and fetch the retention API password,
+    # using a private per-run gcloud config dir that is always deleted
+    # afterwards. no_log is mandatory on the gcloud tasks - do not remove
+    # it, and do not add a debug task that prints the result.
+    # ------------------------------------------------------------------
+    - name: Fetch the retention API password from Google Secret Manager (isolated gcloud config)
+      block:
+        - name: Create a private, per-run gcloud config directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: "retention_gcloud_"
+          register: gcloud_config_dir
+
+        - name: auth gcloud
+          ansible.builtin.shell: "gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json --force --quiet"
+          environment:
+            CLOUDSDK_CONFIG: "{{ gcloud_config_dir.path }}"
+          changed_when: false
+          no_log: true
+
+        - name: get password
+          ansible.builtin.shell: "gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}"
+          environment:
+            CLOUDSDK_CONFIG: "{{ gcloud_config_dir.path }}"
+          register: cir_api_secret_value
+          changed_when: false
+          no_log: true
+
+      always:
+        - name: Remove the per-run gcloud config directory (it holds a login token)
+          ansible.builtin.file:
+            path: "{{ gcloud_config_dir.path }}"
+            state: absent
+          when: gcloud_config_dir.path is defined
+
+    - name: Set retention_api_password from the retrieved secret
+      ansible.builtin.set_fact:
+        retention_api_password: "{{ cir_api_secret_value.stdout }}"
+      no_log: true
+
+    - name: Validate the password was actually retrieved
+      ansible.builtin.assert:
+        that:
+          - retention_api_password | length > 0
+        fail_msg: "Retrieved an empty password from Google Secret Manager - check cir_api_secret and projectid."
+
+    - name: Validate a client list was loaded
+      ansible.builtin.assert:
+        that:
+          - clients is defined
+          - clients | length > 0
+        fail_msg: "clients.yml did not load, or the clients list is empty."
+
+    - name: NOTE on simulation mode
+      ansible.builtin.debug:
+        msg: >
+          simulation_mode is {{ simulation_mode }}. Real deletes require false
+          (the expected setting for this procedure).
+
+    - name: Ensure retention log directory exists
+      ansible.builtin.file:
+        path: "{{ retention_log_dir_jobs }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize accumulators for this run
+      ansible.builtin.set_fact:
+        retention_log_lines: []
+        client_status_list: []
+
+    # ------------------------------------------------------------------
+    # Phase 1: check EVERY client's status, in priority order. Read-only.
+    # A failure for one client is caught inside the included file and does
+    # not stop the loop.
+    # ------------------------------------------------------------------
+    - name: Check status of every client, in priority order (read-only)
+      ansible.builtin.include_tasks: retention_check_one_client.yml
+      loop: "{{ clients }}"
+      loop_control:
+        loop_var: client_item
+        label: "{{ client_item.name }}"
+
+    # ------------------------------------------------------------------
+    # Phase 2: find the first client in priority order that checked OK and
+    # is not yet caught up, and submit a job for that ONE client only.
+    # Clients whose check errored are skipped tonight (and fail the run at
+    # the end).
+    # ------------------------------------------------------------------
+    - name: Work out tonight's candidates and any errored clients
+      ansible.builtin.set_fact:
+        eligible_clients: "{{ client_status_list | selectattr('check_ok') | rejectattr('caught_up') | list }}"
+        errored_clients: "{{ client_status_list | rejectattr('check_ok') | map(attribute='name') | list }}"
+
+    - name: Pick tonight's active client - first eligible in priority order
+      ansible.builtin.set_fact:
+        has_active_client: "{{ eligible_clients | length > 0 }}"
+        active_client: "{{ eligible_clients | first | default({}) }}"
+
+    - name: WARNING - some clients could not be checked and are skipped tonight
+      ansible.builtin.debug:
+        msg: >
+          Status check FAILED for: {{ errored_clients | join(', ') }}. They are
+          skipped tonight; see their client_status_check events for the error.
+          The run will be marked failed at the end.
+      when: errored_clients | length > 0
+
+    - name: Nothing to submit tonight
+      ansible.builtin.debug:
+        msg: >
+          No eligible client tonight. Every client that could be checked has
+          reached its target cutoff date
+          {{ '(some clients errored - see above)' if errored_clients | length > 0 else '' }}.
+      when: not (has_active_client | bool)
+
+    - name: "Tonight's active client identified"
+      ansible.builtin.debug:
+        msg: >
+          Processing {{ active_client.name }} tonight (target cutoff {{ active_client.cutoff_date }},
+          oldest remaining call currently {{ active_client.oldest }}). All clients
+          ahead of this one in clients.yml are already complete (or errored); all
+          clients after it will wait their turn.
+      when: has_active_client | bool
+
+    - name: Submit tonight's job (submission errors are caught and logged, not lost)
+      when: has_active_client | bool
+      block:
+        - name: Submit retention job for tonight's active client
+          ansible.builtin.uri:
+            url: "{{ retention_api_base }}/retention"
+            method: POST
+            user: "{{ retention_api_user }}"
+            password: "{{ retention_api_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              client_name: "{{ active_client.name }}"
+              "#simulation": "{{ simulation_mode | bool }}"
+              limit: "{{ limit | int }}"
+              retentionTimeOlderThan: "{{ active_client.cutoff_date }}T00:00:00Z"
+              stopInSeconds: "{{ stop_in_seconds | int }}"
+              numberOfScans: 0
+              responseByJobId: true
+            status_code: 200
+            return_content: true
+            timeout: "{{ api_timeout_seconds | int }}"
+          register: active_job
+
+        - name: Record whether the server accepted the job (statusCode 0 and a jobId)
+          ansible.builtin.set_fact:
+            job_accepted: >-
+              {{ ((active_job.json.statusCode | default(-1) | int) == 0)
+                 and ((active_job.json.jobId | default('') | string | length) > 0) }}
+            job_id: "{{ active_job.json.jobId | default('none', true) }}"
+            job_status_code: "{{ active_job.json.statusCode | default('missing') }}"
+            job_status_message: "{{ active_job.json.statusMessage | default('') }}"
+            job_search_splunk: "{{ active_job.json.searchSplunk | default('') }}"
+
+      rescue:
+        - name: Job submission FAILED (HTTP error or timeout) - recording it
+          ansible.builtin.set_fact:
+            job_accepted: false
+            job_id: "none"
+            job_status_code: "request_failed"
+            job_status_message: "{{ (ansible_failed_result.msg | default('unknown error') | string)[:500] }}"
+            job_search_splunk: ""
+
+    - name: Report the submission result
+      ansible.builtin.debug:
+        msg: >
+          {{ ('Submitted job ' ~ job_id ~ ' for ' ~ active_client.name ~ '. Splunk search: ' ~ job_search_splunk)
+             if (job_accepted | bool)
+             else ('Job for ' ~ active_client.name ~ ' was NOT accepted: statusCode=' ~ job_status_code ~ ', ' ~ job_status_message) }}
+      when: has_active_client | bool
+
+    - name: Append job-submission event for Splunk log file
+      ansible.builtin.set_fact:
+        retention_log_lines: >-
+          {{ retention_log_lines + [ {
+            'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'event_type': ('retention_job_submitted' if (job_accepted | bool) else 'retention_job_rejected'),
+            'run_id': run_id,
+            'triggered_by': 'nightly-scheduled',
+            'env_code': env_code,
+            'client_name': active_client.name,
+            'client_id': active_client.client_id,
+            'manual_retention_status': ('in_progress' if (job_accepted | bool) else 'error'),
+            'job_accepted': (job_accepted | bool),
+            'job_id': job_id,
+            'retention_time_older_than': (active_client.cutoff_date ~ 'T00:00:00Z'),
+            'limit': (limit | int),
+            'stop_in_seconds': (stop_in_seconds | int),
+            'number_of_scans': 0,
+            'simulation_mode': (simulation_mode | bool),
+            'retention_api_base': retention_api_base,
+            'ado_release_id': ado_release_id,
+            'ado_requested_for': ado_requested_for,
+            'search_splunk': job_search_splunk,
+            'status_code': job_status_code,
+            'status_message': job_status_message
+          } ] }}
+      when: has_active_client | bool
+
+    - name: Append run-summary event for Splunk log file
+      ansible.builtin.set_fact:
+        retention_log_lines: >-
+          {{ retention_log_lines + [ {
+            'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'event_type': 'nightly_run_summary',
+            'run_id': run_id,
+            'triggered_by': 'nightly-scheduled',
+            'env_code': env_code,
+            'clients_checked': (clients | length),
+            'clients_errored': errored_clients,
+            'active_client': (active_client.name if (has_active_client | bool) else 'none'),
+            'manual_retention_status': ('in_progress' if (has_active_client | bool) else 'complete'),
+            'job_submitted': ((has_active_client | bool) and (job_accepted | default(false) | bool)),
+            'job_id': (job_id | default('none')),
+            'run_ok': ((errored_clients | length == 0) and ((not (has_active_client | bool)) or (job_accepted | default(false) | bool)))
+          } ] }}
+
+    - name: Write jobs/status log events to disk for Universal Forwarder pickup
+      ansible.builtin.copy:
+        dest: "{{ retention_log_dir_jobs }}/{{ run_id }}.log"
+        content: "{{ retention_log_lines | map('to_json') | join('\n') }}\n"
+        mode: "0644"
+
+    # ------------------------------------------------------------------
+    # Housekeeping: delete this playbook's own log files older than
+    # log_retention_days. Only touches nightly-*.log in this directory.
+    # ------------------------------------------------------------------
+    - name: Find old nightly log files
+      ansible.builtin.find:
+        paths: "{{ retention_log_dir_jobs }}"
+        patterns: "nightly-*.log"
+        age: "{{ log_retention_days }}d"
+      register: old_nightly_logs
+
+    - name: Delete old nightly log files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_nightly_logs.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Done - reminder to check the Splunk dashboard in the morning
+      ansible.builtin.debug:
+        msg: >
+          Nightly pass complete for env_code={{ env_code }}. Checked {{ clients | length }}
+          client(s) in priority order;
+          {{ ('submitted job ' ~ job_id ~ ' for ' ~ active_client.name) if ((has_active_client | bool) and (job_accepted | bool))
+             else ('job for ' ~ active_client.name ~ ' was NOT accepted') if (has_active_client | bool)
+             else 'submitted nothing - no eligible client' }}.
+          Job log: {{ retention_log_dir_jobs }}/{{ run_id }}.log.
+
+    - name: Fail the run if any client check errored or tonight's job was not accepted
+      ansible.builtin.fail:
+        msg: >
+          Nightly run finished with problems (logs were written first):
+          {{ ('status check failed for ' ~ (errored_clients | join(', ')) ~ '; ') if errored_clients | length > 0 else '' }}
+          {{ ('job for ' ~ active_client.name ~ ' not accepted (statusCode=' ~ job_status_code ~ ': ' ~ job_status_message ~ ')') if ((has_active_client | bool) and not (job_accepted | bool)) else '' }}
+      when: >-
+        (errored_clients | length > 0)
+        or ((has_active_client | bool) and not (job_accepted | bool))
