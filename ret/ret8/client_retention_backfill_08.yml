@@ -1,0 +1,296 @@
+---
+- name: Client Data Retention - Manual Backfill
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - clients.yml
+
+  vars:
+    stats_time_oldest: "2000-01-01T00:00:00Z"
+
+    api_timeout_seconds: 300
+    log_retention_days: 30
+
+    retention_log_dir: "/logs/{{ env_code }}/retention"
+
+    ado_release_id: "{{ lookup('ansible.builtin.env', 'RELEASE_RELEASEID') | default('unknown', true) }}"
+    ado_requested_for: "{{ lookup('ansible.builtin.env', 'RELEASE_DEPLOYMENT_REQUESTEDFOR') | default('unknown', true) }}"
+
+  tasks:
+
+    - name: Validate required inputs are present
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.vars', item, default='') | string | length > 0
+        fail_msg: "Required input '{{ item }}' is missing or empty. Pass it via --extra-vars or a vars file loaded by this playbook."
+        success_msg: "{{ item }} is set"
+        quiet: true
+      loop:
+        - client_name
+        - retention_api_user
+        - retention_api_base
+        - env_code
+        - limit
+        - stop_in_seconds
+        - simulation_mode
+        - projectid
+        - cir_api_secret
+        - json_file
+
+    - name: Fix this run's ID once, so every event and the log filename share it
+      ansible.builtin.set_fact:
+        run_id: "manual-{{ client_name }}-{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+
+    - name: Fetch the retention API password from Google Secret Manager (isolated gcloud config)
+      block:
+        - name: Create a private, per-run gcloud config directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: "retention_gcloud_"
+          register: gcloud_config_dir
+
+        - name: auth gcloud
+          ansible.builtin.shell: "gcloud auth login --cred-file=/shared/config/admin/{{ json_file }}.json --force --quiet"
+          environment:
+            CLOUDSDK_CONFIG: "{{ gcloud_config_dir.path }}"
+          changed_when: false
+          no_log: true
+
+        - name: get password
+          ansible.builtin.shell: "gcloud secrets versions access latest --secret={{ cir_api_secret }} --project={{ projectid }}"
+          environment:
+            CLOUDSDK_CONFIG: "{{ gcloud_config_dir.path }}"
+          register: cir_api_secret_value
+          changed_when: false
+          no_log: true
+
+      always:
+        - name: Remove the per-run gcloud config directory (it holds a login token)
+          ansible.builtin.file:
+            path: "{{ gcloud_config_dir.path }}"
+            state: absent
+          when: gcloud_config_dir.path is defined
+
+    - name: Set retention_api_password from the retrieved secret
+      ansible.builtin.set_fact:
+        retention_api_password: "{{ cir_api_secret_value.stdout }}"
+      no_log: true
+
+    - name: Validate the password was actually retrieved
+      ansible.builtin.assert:
+        that:
+          - retention_api_password | length > 0
+        fail_msg: "Retrieved an empty password from Google Secret Manager - check cir_api_secret and projectid."
+
+    - name: Look up this client in clients.yml, if already registered there
+      ansible.builtin.set_fact:
+        matched_client: "{{ (clients | default([]) | selectattr('name', 'equalto', client_name) | list | first) | default(none) }}"
+
+    - name: Determine effective retention cutoff date (explicit override wins; otherwise clients.yml)
+      ansible.builtin.set_fact:
+        effective_retention_date: "{{ retention_date if (retention_date is defined and retention_date | length > 0) else (matched_client.retention_cutoff_date if matched_client is not none else '') }}"
+
+    - name: Fail clearly if no retention date is available from either source
+      ansible.builtin.assert:
+        that:
+          - effective_retention_date | length > 0
+        fail_msg: >
+          No retention_date was passed via --extra-vars, and {{ client_name }}
+          was not found in clients.yml either (or has no retention_cutoff_date
+          set there). Either pass retention_date explicitly, or add
+          {{ client_name }} to clients.yml with a retention_cutoff_date first.
+
+    - name: WARNING if the explicitly-passed date differs from what's configured in clients.yml
+      ansible.builtin.debug:
+        msg: >
+          NOTE: you passed retention_date={{ retention_date }}, but clients.yml has
+          retention_cutoff_date={{ matched_client.retention_cutoff_date }} configured
+          for {{ client_name }}. Proceeding with the explicitly-passed value for this
+          run - update clients.yml separately if these should stay in sync with the
+          nightly queue.
+      when:
+        - matched_client is not none
+        - retention_date is defined and retention_date | length > 0
+        - retention_date != matched_client.retention_cutoff_date
+
+    - name: Determine this client's numeric ID, if known from clients.yml
+      ansible.builtin.set_fact:
+        effective_client_id: "{{ matched_client.client_id if matched_client is not none else 'unknown' }}"
+
+    - name: Log where the cutoff date came from
+      ansible.builtin.debug:
+        msg: >
+          Using retention cutoff {{ effective_retention_date }} for {{ client_name }}
+          ({{ 'explicitly passed via --extra-vars' if (retention_date is defined and retention_date | length > 0) else 'looked up from clients.yml' }}).
+          client_id: {{ effective_client_id }}.
+
+    - name: Build the full ISO cutoff timestamp
+      ansible.builtin.set_fact:
+        retention_cutoff_date: "{{ effective_retention_date }}T00:00:00Z"
+
+    - name: Log run parameters
+      ansible.builtin.debug:
+        msg: >
+          Starting retention backfill - client={{ client_name }},
+          cutoff={{ retention_cutoff_date }}, simulation_mode={{ simulation_mode }},
+          stop_in_seconds={{ stop_in_seconds }}, run_id={{ run_id }}
+
+    - name: Ensure retention log directory exists
+      ansible.builtin.file:
+        path: "{{ retention_log_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize the log-line accumulator for this run
+      ansible.builtin.set_fact:
+        retention_log_lines: []
+
+    - name: Get current statistics up to the cutoff
+      ansible.builtin.uri:
+        url: "{{ retention_api_base }}/statistics"
+        method: POST
+        user: "{{ retention_api_user }}"
+        password: "{{ retention_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          client_name: "{{ client_name }}"
+          timeOldest: "{{ stats_time_oldest }}"
+          timeNewest: "{{ retention_cutoff_date }}"
+        status_code: 200
+        return_content: true
+        timeout: "{{ api_timeout_seconds | int }}"
+      register: stats_before
+
+    - name: Validate the statistics response
+      ansible.builtin.assert:
+        that:
+          - stats_before.json is defined
+          - (stats_before.json.statusCode | default(-1) | int) == 0
+          - stats_before.json.results is defined
+          - stats_before.json.results is mapping
+        fail_msg: >-
+          Statistics call returned an unexpected response for {{ client_name }}:
+          statusCode={{ stats_before.json.statusCode | default('missing') }},
+          statusMessage={{ stats_before.json.statusMessage | default('missing') }}.
+          No job was submitted.
+
+    - name: Record where the client stands right now
+      ansible.builtin.set_fact:
+        records_before: "{{ stats_before.json.results.voiceRecordsCount.total | int }}"
+        oldest_before: "{{ (stats_before.json.results.oldestCallId | default({}, true)).stopTime | default('none', true) }}"
+
+    - name: Show current state
+      ansible.builtin.debug:
+        msg: >
+          {{ client_name }} now - voice records before cutoff: {{ records_before }},
+          oldest remaining call: {{ oldest_before if oldest_before != 'none' else 'none - already clear of the cutoff' }}
+
+    - name: Start the retention job (submission errors are caught and logged)
+      block:
+        - name: Start retention job
+          ansible.builtin.uri:
+            url: "{{ retention_api_base }}/retention"
+            method: POST
+            user: "{{ retention_api_user }}"
+            password: "{{ retention_api_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              client_name: "{{ client_name }}"
+              "#simulation": "{{ simulation_mode | bool }}"
+              limit: "{{ limit | int }}"
+              retentionTimeOlderThan: "{{ retention_cutoff_date }}"
+              stopInSeconds: "{{ stop_in_seconds | int }}"
+              numberOfScans: 0
+              responseByJobId: true
+            status_code: 200
+            return_content: true
+            timeout: "{{ api_timeout_seconds | int }}"
+          register: retention_start
+
+        - name: Record whether the server accepted the job (statusCode 0 and a jobId)
+          ansible.builtin.set_fact:
+            job_accepted: >-
+              {{ ((retention_start.json.statusCode | default(-1) | int) == 0)
+                 and ((retention_start.json.jobId | default('') | string | length) > 0) }}
+            job_id: "{{ retention_start.json.jobId | default('none', true) }}"
+            job_status_code: "{{ retention_start.json.statusCode | default('missing') }}"
+            job_status_message: "{{ retention_start.json.statusMessage | default('') }}"
+            job_search_splunk: "{{ retention_start.json.searchSplunk | default('') }}"
+
+      rescue:
+        - name: Job submission FAILED (HTTP error or timeout) - recording it
+          ansible.builtin.set_fact:
+            job_accepted: false
+            job_id: "none"
+            job_status_code: "request_failed"
+            job_status_message: "{{ (ansible_failed_result.msg | default('unknown error') | string)[:500] }}"
+            job_search_splunk: ""
+
+    - name: Show the submission result
+      ansible.builtin.debug:
+        msg: >
+          {{ ('Job started: ' ~ job_id ~ '. The application will work it in the background until stop_in_seconds or the end of its processing window. Splunk search: ' ~ job_search_splunk)
+             if (job_accepted | bool)
+             else ('Job was NOT accepted: statusCode=' ~ job_status_code ~ ', ' ~ job_status_message) }}
+
+    - name: Append job-submission event for Splunk log file
+      ansible.builtin.set_fact:
+        retention_log_lines: >-
+          {{ retention_log_lines + [ {
+            'event_time': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'event_type': ('retention_job_submitted' if (job_accepted | bool) else 'retention_job_rejected'),
+            'run_id': run_id,
+            'triggered_by': 'manual',
+            'env_code': env_code,
+            'ado_requested_for': ado_requested_for,
+            'client_name': client_name,
+            'client_id': effective_client_id,
+            'manual_retention_status': ('in_progress' if (job_accepted | bool) else 'error'),
+            'job_accepted': (job_accepted | bool),
+            'job_id': job_id,
+            'retention_time_older_than': retention_cutoff_date,
+            'records_before_cutoff_at_submit': (records_before | int),
+            'oldest_call_at_submit': oldest_before,
+            'limit': (limit | int),
+            'stop_in_seconds': (stop_in_seconds | int),
+            'number_of_scans': 0,
+            'simulation_mode': (simulation_mode | bool),
+            'retention_api_base': retention_api_base,
+            'ado_release_id': ado_release_id,
+            'search_splunk': job_search_splunk,
+            'status_code': job_status_code,
+            'status_message': job_status_message
+          } ] }}
+
+    - name: Write the log event to disk for Universal Forwarder pickup
+      ansible.builtin.copy:
+        dest: "{{ retention_log_dir }}/{{ run_id }}.log"
+        content: "{{ retention_log_lines | map('to_json') | join('\n') }}\n"
+        mode: "0644"
+
+    - name: Find old manual log files
+      ansible.builtin.find:
+        paths: "{{ retention_log_dir }}"
+        patterns: "manual-*.log"
+        age: "{{ log_retention_days }}d"
+      register: old_manual_logs
+
+    - name: Delete old manual log files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_manual_logs.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Fail the run if the job was not accepted
+      ansible.builtin.fail:
+        msg: >
+          Retention job for {{ client_name }} was not accepted
+          (statusCode={{ job_status_code }}: {{ job_status_message }}).
+          Logged to {{ retention_log_dir }}/{{ run_id }}.log.
+      when: not (job_accepted | bool)
