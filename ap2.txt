@@ -1,0 +1,208 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+rem ====================================================================
+rem  extract_call.bat - extract one SIP call (SIP + RTP + RTCP) from
+rem  large capture files using tshark, mergecap and editcap.
+rem  Pass 1 runs several files in parallel at low priority.
+rem  Edit the values below. Leave a value empty to be prompted for it.
+rem  Lists (ports, hosts) can be separated by spaces or commas.
+rem ====================================================================
+set "RAW_DIR=G:\nov18\sample1\sample1_raw"
+set "OUT_DIR=G:\nov18\sample1\filtered"
+set "CALLID=f6715507afdd2@1.2.2.14"
+set "SIP_PORTS=5060, 5065"
+set "MEDIA_PORTS=34704, 33371, 33634, 33638"
+set "HOSTS=10.19.3.200"
+set "START=2026-11-18 16:22:00"
+set "END=2026-11-18 17:00:00"
+set "ADD_RTCP=1"
+rem  JOBS: files processed at once. Blank = CPU cores minus 2.
+rem  If the disk is the bottleneck, 4-6 is usually the sweet spot.
+set "JOBS="
+rem  TURBO=1: decode only eth/vlan/ip/tcp/udp in pass 1 (fastest; test first)
+set "TURBO=0"
+set "WS=C:\Program Files\Wireshark"
+rem ====================================================================
+
+if not defined RAW_DIR     set /p "RAW_DIR=Folder with raw captures: "
+if not defined OUT_DIR     set /p "OUT_DIR=Output folder: "
+if not defined CALLID      set /p "CALLID=SIP Call-ID: "
+if not defined SIP_PORTS   set /p "SIP_PORTS=SIP port(s): "
+if not defined MEDIA_PORTS set /p "MEDIA_PORTS=Media port(s): "
+if not defined HOSTS       set /p "HOSTS=Host IP(s) to restrict to (Enter = none): "
+if not defined START       set /p "START=Start (YYYY-MM-DD HH:MM:SS): "
+if not defined END         set /p "END=End   (YYYY-MM-DD HH:MM:SS): "
+for %%v in (RAW_DIR OUT_DIR CALLID SIP_PORTS MEDIA_PORTS START END) do (
+  if not defined %%v (echo Missing value: %%v & exit /b 1)
+)
+
+set "TSHARK=%WS%\tshark.exe"
+set "MERGECAP=%WS%\mergecap.exe"
+set "EDITCAP=%WS%\editcap.exe"
+set "CAPINFOS=%WS%\capinfos.exe"
+if not exist "!TSHARK!"   (echo tshark.exe not found in "!WS!" - fix WS at the top & exit /b 1)
+if not exist "!MERGECAP!" (echo mergecap.exe not found in "!WS!" - fix WS at the top & exit /b 1)
+
+if not defined JOBS set /a JOBS=NUMBER_OF_PROCESSORS-2
+if !JOBS! lss 1 set "JOBS=1"
+
+for /f "tokens=1 delims=@" %%a in ("!CALLID!") do set "CIDSHORT=%%a"
+set "OUT=%OUT_DIR%\call_!CIDSHORT!.pcapng"
+set "WORK=%OUT_DIR%\_work_!CIDSHORT!"
+if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+if exist "%WORK%" rmdir /s /q "%WORK%"
+mkdir "%WORK%"
+
+rem ---- pass-1 filter: ports (+1 for RTCP) and optional hosts ----
+rem      (eq/and/or/not instead of == && || ! so cmd leaves them alone)
+set "PF="
+for %%p in (%SIP_PORTS%) do set "PF=!PF! or tcp.port eq %%p or udp.port eq %%p"
+for %%p in (%MEDIA_PORTS%) do (
+  set "PF=!PF! or udp.port eq %%p"
+  if "!ADD_RTCP!"=="1" (
+    set /a R=%%p+1
+    set "PF=!PF! or udp.port eq !R!"
+  )
+)
+set "F1=(!PF:~4!)"
+if defined HOSTS (
+  set "HF="
+  for %%h in (%HOSTS%) do set "HF=!HF! or ip.addr eq %%h"
+  set "F1=!F1! and (!HF:~4!)"
+)
+
+rem ---- pass-1 speed options: decode as little as possible ----
+set "FAST=-o tcp.desegment_tcp_streams:FALSE -o tcp.analyze_sequence_numbers:FALSE --disable-protocol sip --disable-protocol sdp --disable-protocol rtp --disable-protocol rtcp"
+if "!TURBO!"=="1" set "FAST=-o tcp.desegment_tcp_streams:FALSE --disable-protocol ALL --enable-protocol frame --enable-protocol eth --enable-protocol ethertype --enable-protocol vlan --enable-protocol ip --enable-protocol tcp --enable-protocol udp"
+
+rem ---- decode the custom SIP ports as SIP (pass 2) ----
+set "DECODE="
+for %%p in (%SIP_PORTS%) do set "DECODE=!DECODE! -d tcp.port==%%p,sip -d udp.port==%%p,sip"
+
+echo.
+echo Pass 1 filter: !F1!
+echo Running up to !JOBS! files at a time (low priority)
+if "!TURBO!"=="1" echo TURBO mode on
+echo.
+
+rem ---- pass 1: filter the raw files in parallel ----
+set /a N=0
+set /a LASTDONE=-1
+for %%f in ("%RAW_DIR%\*") do (
+  set "OK="
+  for %%x in (.pcap .pcapng .cap) do if /i "%%~xf"=="%%x" set "OK=1"
+  if defined OK (
+    call :waitslot
+    set /a N+=1
+    echo [!N!] starting %%~nxf  ^(%%~zf bytes^)
+    (
+      echo @"!TSHARK!" -n -r "%%~ff" !FAST! -Y "!F1!" -w "!WORK!\part_!N!.pcapng" 2^>nul
+      echo @^> "!WORK!\done_!N!" echo %%errorlevel%% %%~nxf
+    ) > "!WORK!\job_!N!.cmd"
+    start "" /b /low cmd /c "!WORK!\job_!N!.cmd"
+  )
+)
+if "!N!"=="0" (echo No capture files found in "!RAW_DIR!" & exit /b 1)
+echo.
+echo All files started - waiting for the remaining ones...
+call :waitall
+
+rem ---- report any tshark errors (often a truncated last packet; output still usable) ----
+for %%d in ("%WORK%\done_*") do (
+  for /f "usebackq tokens=1*" %%a in ("%%~fd") do (
+    if not "%%a"=="0" echo   WARNING: tshark exit code %%a on %%b ^(often a truncated last packet^)
+  )
+)
+
+rem ---- merge the pieces ----
+echo.
+echo Merging...
+set "MERGED=%WORK%\merged.pcapng"
+set "FIRST=1"
+for %%p in ("%WORK%\part_*.pcapng") do (
+  if defined FIRST (
+    copy /y "%%~fp" "!MERGED!" >nul
+    set "FIRST="
+  ) else (
+    "!MERGECAP!" -w "!WORK!\tmp.pcapng" "!MERGED!" "%%~fp"
+    move /y "!WORK!\tmp.pcapng" "!MERGED!" >nul
+  )
+)
+
+rem ---- cut to the time window ----
+set "WIN=%WORK%\window.pcapng"
+if exist "!EDITCAP!" (
+  echo Trimming to !START! - !END!
+  "!EDITCAP!" -A "!START!" -B "!END!" "!MERGED!" "!WIN!"
+) else (
+  echo editcap.exe not found - skipping the time trim
+  copy /y "!MERGED!" "!WIN!" >nul
+)
+
+rem ---- pass 2: keep only this call's SIP (and the whole TCP streams it used) ----
+set "CIDF=sip.Call-ID eq \"!CALLID!\""
+"!TSHARK!" -n -r "!WIN!" !DECODE! -Y "!CIDF!" -T fields -e frame.number -e tcp.stream > "%WORK%\sip.txt" 2>nul
+for %%A in ("%WORK%\sip.txt") do set "SIPSIZE=%%~zA"
+if "!SIPSIZE!"=="0" (
+  echo WARNING: no SIP found for this Call-ID ^(wrong ID or ports, or TLS^). Keeping all SIP.
+  copy /y "!WIN!" "!OUT!" >nul
+) else (
+  set "F2=!CIDF! or (udp and not sip)"
+  set "SEEN= "
+  for /f "usebackq tokens=1,2" %%a in ("%WORK%\sip.txt") do (
+    if not "%%b"=="" (
+      if "!SEEN: %%b =!"=="!SEEN!" (
+        set "SEEN=!SEEN!%%b "
+        set "F2=!F2! or tcp.stream eq %%b"
+      )
+    )
+  )
+  "!TSHARK!" -n -r "!WIN!" !DECODE! -Y "!F2!" -w "!OUT!" 2>nul
+)
+
+rem ---- summary ----
+echo.
+echo Written: !OUT!
+if exist "!CAPINFOS!" "!CAPINFOS!" -c -a -e -s "!OUT!"
+(
+  echo SIP messages for this Call-ID:
+  "!TSHARK!" -n -r "!OUT!" !DECODE! -Y "!CIDF!" -T fields -E separator=/t -e frame.time -e ip.src -e ip.dst -e sip.Method -e sip.Status-Code -e sip.CSeq
+  echo.
+  echo RTP streams:
+  "!TSHARK!" -n -r "!OUT!" --enable-heuristic rtp_udp -q -z rtp,streams
+) > "!OUT!.summary.txt" 2>nul
+type "!OUT!.summary.txt"
+
+rmdir /s /q "%WORK%"
+echo.
+echo Open in Wireshark with filter:  sip.Call-ID eq "!CALLID!" or rtp or rtcp
+endlocal & exit /b
+
+rem ====================================================================
+rem  Helpers: each background job creates done_N when it finishes
+rem ====================================================================
+:waitslot
+call :countdone
+set /a RUNNING=N-DONE
+if !RUNNING! geq !JOBS! (
+  ping -n 3 127.0.0.1 >nul
+  goto waitslot
+)
+exit /b
+
+:waitall
+call :countdone
+if not "!DONE!"=="!LASTDONE!" (
+  echo   !DONE! of !N! files done
+  set "LASTDONE=!DONE!"
+)
+if !DONE! lss !N! (
+  ping -n 6 127.0.0.1 >nul
+  goto waitall
+)
+exit /b
+
+:countdone
+set "DONE=0"
+for %%d in ("%WORK%\done_*") do set /a DONE+=1
+exit /b
